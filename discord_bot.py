@@ -1090,8 +1090,16 @@ async def before_keep_alive():
 async def on_ready():
     logger.info(f"Bot online: {bot.user} (ID: {bot.user.id})")
     try:
-        synced = await bot.tree.sync()
-        logger.info(f"Synced {len(synced)} slash commands")
+        # Guild sync = instant; global sync can take up to 1 hour
+        total = 0
+        for guild in bot.guilds:
+            bot.tree.copy_global_to(guild)
+            synced = await bot.tree.sync(guild=guild)
+            total += len(synced)
+            logger.info(f"Synced {len(synced)} commands to {guild.name}")
+        # Also do global sync for any future guilds
+        await bot.tree.sync()
+        logger.info(f"Total: synced {total} slash commands across {len(bot.guilds)} guilds + global")
     except Exception as e:
         logger.error(f"Sync error: {e}")
     await bot.change_presence(activity=discord.Activity(
@@ -1101,6 +1109,18 @@ async def on_ready():
     if RENDER_EXTERNAL_URL and not keep_alive.is_running():
         keep_alive.start()
         logger.info("Keep-alive started (URL: %s)", RENDER_EXTERNAL_URL)
+
+
+# ─── Auto-sync commands when joining a new guild ─────────
+@bot.event
+async def on_guild_join(guild):
+    """Sync slash commands immediately when bot joins a new server."""
+    try:
+        bot.tree.copy_global_to(guild)
+        synced = await bot.tree.sync(guild=guild)
+        logger.info(f"Synced {len(synced)} commands to new guild: {guild.name}")
+    except Exception as e:
+        logger.error(f"Guild join sync error: {e}")
 
 
 # ─── Flag emoji reaction translation ────────────────────
