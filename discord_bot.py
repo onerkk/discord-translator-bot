@@ -1951,15 +1951,44 @@ self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.add
 self.addEventListener('fetch',e=>{e.respondWith(fetch(e.request).catch(()=>caches.match(e.request)))});'''
 
 def generate_icon_png(size=192):
-    """Generate a simple purple circle PNG as icon."""
+    """Generate a proper sized purple PNG icon for PWA."""
     import struct, zlib
-    png = (b'\x89PNG\r\n\x1a\n'
-           + struct.pack('>I', 13) + b'IHDR' + struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0)
-           + struct.pack('>I', zlib.crc32(b'IHDR' + struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0)) & 0xffffffff)
-           + struct.pack('>I', 12) + b'IDAT' + zlib.compress(b'\x00\x58\x65\xF2')
-           + struct.pack('>I', zlib.crc32(b'IDAT' + zlib.compress(b'\x00\x58\x65\xF2')) & 0xffffffff)
-           + struct.pack('>I', 0) + b'IEND' + struct.pack('>I', zlib.crc32(b'IEND') & 0xffffffff))
+    width = height = size
+    # Build raw pixel data: purple (#5865F2) square with rounded-look border
+    raw = b''
+    center = size / 2
+    radius = size * 0.42
+    for y in range(height):
+        raw += b'\x00'  # PNG filter: none
+        for x in range(width):
+            # Distance from center for rounded corners
+            dx = abs(x - center)
+            dy = abs(y - center)
+            corner_dist = max(dx, dy)
+            if corner_dist < radius:
+                raw += b'\x58\x65\xF2'  # Purple #5865F2
+            elif corner_dist < radius + 3:
+                raw += b'\x48\x55\xE2'  # Slightly darker edge
+            else:
+                raw += b'\x0a\x0a\x0a'  # Dark background #0a0a0a
+    compressed = zlib.compress(raw, 9)
+    # Build PNG
+    def make_chunk(chunk_type, data):
+        chunk = chunk_type + data
+        return struct.pack('>I', len(data)) + chunk + struct.pack('>I', zlib.crc32(chunk) & 0xffffffff)
+    ihdr_data = struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)
+    png = b'\x89PNG\r\n\x1a\n'
+    png += make_chunk(b'IHDR', ihdr_data)
+    png += make_chunk(b'IDAT', compressed)
+    png += make_chunk(b'IEND', b'')
     return png
+
+# Cache generated icons to avoid regenerating on every request
+_icon_cache = {}
+def get_icon(size):
+    if size not in _icon_cache:
+        _icon_cache[size] = generate_icon_png(size)
+    return _icon_cache[size]
 
 
 # ─── Web server + Admin API ──────────────────────────────
@@ -2221,7 +2250,9 @@ async def sw_handler(request):
     return web.Response(text=DC_SW_JS, content_type="application/javascript")
 
 async def icon_handler(request):
-    return web.Response(body=generate_icon_png(), content_type="image/png")
+    size = 512 if "512" in request.path else 192
+    return web.Response(body=get_icon(size), content_type="image/png",
+                        headers={"Cache-Control": "public, max-age=86400"})
 
 async def start_web_server():
     app = web.Application()
