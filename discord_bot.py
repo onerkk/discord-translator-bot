@@ -1933,7 +1933,8 @@ async function loadChannels(){
         <option value="th" ${c.target_lang==='th'?'selected':''}>泰文</option>
         <option value="ja" ${c.target_lang==='ja'?'selected':''}>日文</option>
         <option value="ko" ${c.target_lang==='ko'?'selected':''}>韓文</option>
-      </select> ｜跳過: ${c.skip_count}人</div>
+      </select> ｜跳過: ${c.skip_count}人
+      ｜🖼️${c.img_on?'✅':'❌'} 🎤${c.voice_on?'✅':'❌'} 📋${c.wo_on?'✅':'❌'}</div>
     </div>
   `).join('');
 }
@@ -1945,7 +1946,7 @@ async function loadUsers(){
   if(!d.users||!d.users.length){el.innerHTML='<div class="empty">尚無使用者紀錄</div>';return}
   el.innerHTML=d.users.map(u=>`
     <div class="card">
-      <div class="card-title"><span>${u.name}</span><span class="badge badge-on">${u.lang}</span></div>
+      <div class="card-title"><span>${u.name}</span><span class="badge ${u.lang==='—'?'badge-off':'badge-on'}">${u.lang==='—'?'未設定':u.lang}</span></div>
       <div class="card-sub">ID: ${u.id}</div>
     </div>
   `).join('');
@@ -2162,22 +2163,28 @@ async def api_admin_channels(request):
     if bot.is_ready():
         for guild in bot.guilds:
             for ch in guild.text_channels:
+                if not ch.permissions_for(guild.me).send_messages:
+                    continue
                 ch_id = ch.id
-                if ch_id in channel_settings or ch_id in channel_target_lang:
-                    channels.append({
-                        "id": str(ch_id),
-                        "name": ch.name,
-                        "guild": guild.name,
-                        "translation_on": channel_settings.get(ch_id, True),
-                        "target_lang": channel_target_lang.get(ch_id, "id"),
-                        "skip_count": len(channel_skip_users.get(ch_id, set())),
-                    })
+                channels.append({
+                    "id": str(ch_id),
+                    "name": ch.name,
+                    "guild": guild.name,
+                    "translation_on": channel_settings.get(ch_id, True),
+                    "target_lang": channel_target_lang.get(ch_id, "id"),
+                    "skip_count": len(channel_skip_users.get(ch_id, set())),
+                    "img_on": channel_img_settings.get(ch_id, True),
+                    "voice_on": channel_audio_settings.get(ch_id, True),
+                    "wo_on": channel_wo_settings.get(ch_id, True),
+                })
     return web.json_response({"channels": channels})
 
 async def api_admin_users(request):
     if not check_admin_key(request):
         return web.json_response({"error": "forbidden"}, status=403)
     users = []
+    seen = set()
+    # Users with known language preferences
     for uid, lang in user_lang_prefs.items():
         name = str(uid)
         if bot.is_ready():
@@ -2187,6 +2194,15 @@ async def api_admin_users(request):
                     name = member.display_name
                     break
         users.append({"id": str(uid), "name": name, "lang": lang})
+        seen.add(uid)
+    # Also show guild members without prefs yet
+    if bot.is_ready():
+        for guild in bot.guilds:
+            for member in guild.members:
+                if member.bot or member.id in seen:
+                    continue
+                users.append({"id": str(member.id), "name": member.display_name, "lang": "—"})
+                seen.add(member.id)
     users.sort(key=lambda x: x["name"])
     return web.json_response({"users": users})
 
