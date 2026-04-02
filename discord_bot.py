@@ -1569,6 +1569,11 @@ ADMIN_HTML = '''<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>翻譯Bot 管理後台 (Discord)</title>
 <meta name="theme-color" content="#5865F2">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="DC Bot管理">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon-192.png">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#e0e0e0;min-height:100vh}
@@ -1755,9 +1760,41 @@ window.addEventListener('load',()=>{
   const k=localStorage.getItem('dc_admin_key');
   if(k){document.getElementById('pwInput').value=k;doLogin()}
 });
+if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(()=>{})}
 </script>
 </body>
 </html>'''
+
+
+# ─── PWA resources ───────────────────────────────────────
+DC_MANIFEST = json.dumps({
+    "name": "翻譯Bot 管理後台 (Discord)",
+    "short_name": "DC Bot管理",
+    "start_url": "/admin",
+    "display": "standalone",
+    "background_color": "#0a0a0a",
+    "theme_color": "#5865F2",
+    "icons": [
+        {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+        {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"}
+    ]
+}, ensure_ascii=False)
+
+DC_SW_JS = '''const CACHE='dc-bot-admin-v1';
+const URLS=['/admin'];
+self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(URLS)))});
+self.addEventListener('fetch',e=>{e.respondWith(fetch(e.request).catch(()=>caches.match(e.request)))});'''
+
+def generate_icon_png(size=192):
+    """Generate a simple purple circle PNG as icon."""
+    import struct, zlib
+    png = (b'\x89PNG\r\n\x1a\n'
+           + struct.pack('>I', 13) + b'IHDR' + struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0)
+           + struct.pack('>I', zlib.crc32(b'IHDR' + struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0)) & 0xffffffff)
+           + struct.pack('>I', 12) + b'IDAT' + zlib.compress(b'\x00\x58\x65\xF2')
+           + struct.pack('>I', zlib.crc32(b'IDAT' + zlib.compress(b'\x00\x58\x65\xF2')) & 0xffffffff)
+           + struct.pack('>I', 0) + b'IEND' + struct.pack('>I', zlib.crc32(b'IEND') & 0xffffffff))
+    return png
 
 
 # ─── Web server + Admin API ──────────────────────────────
@@ -1848,11 +1885,24 @@ async def api_admin_storage_json(request):
         headers={"Content-Disposition": "attachment; filename=storage_data.json"}
     )
 
+async def manifest_handler(request):
+    return web.Response(text=DC_MANIFEST, content_type="application/manifest+json")
+
+async def sw_handler(request):
+    return web.Response(text=DC_SW_JS, content_type="application/javascript")
+
+async def icon_handler(request):
+    return web.Response(body=generate_icon_png(), content_type="image/png")
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/health", health_handler)
     app.router.add_get("/", health_handler)
     app.router.add_get("/admin", admin_page_handler)
+    app.router.add_get("/manifest.json", manifest_handler)
+    app.router.add_get("/sw.js", sw_handler)
+    app.router.add_get("/icon-192.png", icon_handler)
+    app.router.add_get("/icon-512.png", icon_handler)
     app.router.add_get("/api/admin/status", api_admin_status)
     app.router.add_get("/api/admin/stats", api_admin_stats)
     app.router.add_get("/api/admin/channels", api_admin_channels)
