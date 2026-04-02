@@ -26,6 +26,8 @@ logger = logging.getLogger("discord_bot")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "changeme")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "onerkk/discord-translator-bot")
 
 oai = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
@@ -33,6 +35,9 @@ oai = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 channel_settings = {}       # {channel_id: True/False} translation on/off
 channel_target_lang = {}    # {channel_id: "id"/"en"/...}
 channel_skip_users = {}     # {channel_id: set(user_ids)}
+channel_img_settings = {}   # {channel_id: True/False} image OCR on/off
+channel_audio_settings = {} # {channel_id: True/False} voice on/off
+channel_wo_settings = {}    # {channel_id: True/False} work order detection on/off
 
 # Translation cache
 translation_cache = {}
@@ -494,12 +499,32 @@ def cache_set(text, src, tgt, result):
         del translation_cache[oldest]
     translation_cache[(text.strip(), src, tgt)] = (result, time.time())
 
+def safe_embed_text(text, max_len=4090):
+    """Truncate text to fit Discord embed limits (4096 chars)."""
+    if not text:
+        return text
+    if len(text) > max_len:
+        return text[:max_len] + "..."
+    return text
+
+def translate_with_retry(func, text, src, tgt, max_retries=2):
+    """Call a translation function with retry on failure."""
+    for attempt in range(max_retries + 1):
+        result = func(text, src, tgt)
+        if result:
+            return result
+        if attempt < max_retries:
+            wait = 1 * (attempt + 1)
+            logger.warning("Retry %d/%d after %ds for %s", attempt + 1, max_retries, wait, func.__name__)
+            time.sleep(wait)
+    return None
+
 def translate(text, src, tgt):
     cached = cache_get(text, src, tgt)
     if cached:
         return cached
 
-    result = translate_openai(text, src, tgt)
+    result = translate_with_retry(translate_openai, text, src, tgt, max_retries=2)
 
     # Retry with strict mode if source leakage detected
     if result and not is_translation_valid(result, src, tgt):
@@ -517,11 +542,18 @@ def translate(text, src, tgt):
         cache_set(text, src, tgt, result)
         return result
 
-    # Fallback: Google Translate
-    result = translate_google(text, src, tgt)
+    # Fallback: Google Translate with retry
+    result = translate_with_retry(translate_google, text, src, tgt, max_retries=1)
     if result and is_translation_valid(result, src, tgt):
         cache_set(text, src, tgt, result)
         return result
+
+    # Last chance repair
+    if result:
+        repaired = translate_openai(text, src, tgt, strict=True, repair_mode=True, bad_result=result)
+        if repaired and is_translation_valid(repaired, src, tgt):
+            cache_set(text, src, tgt, repaired)
+            return repaired
 
     return None
 
@@ -576,7 +608,11 @@ def ocr_and_translate_image(image_base64, tgt_lang):
                         "3. Translate naturally, casual daily language for factory workers.\n"
                         "4. Target Traditional Chinese = Taiwan style.\n"
                         "5. NEVER translate or romanize person names. Keep Chinese names in original characters.\n"
-                        "6. NEVER translate customer/company names. Keep them EXACTLY as-is.\n"
+                        "6. NEVER translate customer/company names. Keep them EXACTLY as-is: "
+                        "賽利金屬, 寶麗金屬, 田華榕, 佳東, 蘋果, 常州眾山, 大順, 大成, 巨昌, 北澤, 鴻運, 畯圓, 名威, 右勝, "
+                        "貝克休斯, 皇銘, 台芝, 百堅, 津展, 曜麟, 廉錩, 盛昌遠, 永吉, 光輝, "
+                        "DACAPO, CASTLE, LOTUS, METALINOX, KANGRUI, SUNGEUN, STEELINC, GLH, SHINKO, WING KEUNG, "
+                        "BOLLINGHAUS, COGNE, TCI, PLUTUS, SAMWON, DK METAL, KJ.\n"
                         "7. If there is no text in the image, output exactly: NO_TEXT_FOUND"
                     )
                 },
@@ -1037,7 +1073,7 @@ async def on_raw_reaction_add(payload):
         if not result:
             return
         flag = LANG_FLAGS.get(tgt, "🌐")
-        embed = discord.Embed(description=f"{flag} {result}", color=0x06C755)
+        embed = discord.Embed(description=safe_embed_text(f"{flag} {result}"), color=0x06C755)
         embed.set_footer(text=f"反應翻譯 {emoji} | {LANG_NAMES.get(src, src)[:2]} → {LANG_NAMES.get(tgt, tgt)[:2]}")
         await message.reply(embed=embed, mention_author=False)
         usage_stats["reaction_translations"] += 1
@@ -1127,7 +1163,7 @@ async def on_message(message):
         result = translate(text, src, tgt)
         if result:
             flag = LANG_FLAGS.get(tgt, "🌐")
-            embed = discord.Embed(description=f"{flag} {result}", color=0x06C755)
+            embed = discord.Embed(description=safe_embed_text(f"{flag} {result}"), color=0x06C755)
             embed.set_footer(text=f"私訊翻譯 | {LANG_NAMES.get(src, src)[:2]} → {LANG_NAMES.get(tgt, tgt)[:2]}")
             view = TranslateView(text, src, tgt)
             await message.reply(embed=embed, view=view)
@@ -1145,22 +1181,26 @@ async def on_message(message):
     # ── Handle image attachments ──
     for attachment in message.attachments:
         if any(attachment.filename.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']):
+            # Check if image translation is on
+            if not channel_img_settings.get(ch_id, True):
+                continue
             try:
                 img_bytes = await attachment.read()
                 img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-                # Check for work order first
-                ocr_text = ocr_image_only(img_b64)
-                if ocr_text:
-                    customer = detect_work_order(ocr_text)
-                    if customer:
-                        storage_info = format_storage_for_work_order(customer)
-                        if storage_info:
-                            embed = discord.Embed(description=storage_info, color=0xFFD700)
-                            embed.set_footer(text="📋 工單自動偵測")
-                            await message.reply(embed=embed, mention_author=False)
-                            usage_stats["work_orders_detected"] += 1
-                            continue
+                # Check for work order first (if wo enabled)
+                if channel_wo_settings.get(ch_id, True):
+                    ocr_text = ocr_image_only(img_b64)
+                    if ocr_text:
+                        customer = detect_work_order(ocr_text)
+                        if customer:
+                            storage_info = format_storage_for_work_order(customer)
+                            if storage_info:
+                                embed = discord.Embed(description=storage_info, color=0xFFD700)
+                                embed.set_footer(text="📋 工單自動偵測")
+                                await message.reply(embed=embed, mention_author=False)
+                                usage_stats["work_orders_detected"] += 1
+                                continue
 
                 # OCR + translate
                 result = ocr_and_translate_image(img_b64, tgt_lang)
@@ -1177,6 +1217,9 @@ async def on_message(message):
 
         # ── Handle audio/voice attachments ──
         if any(attachment.filename.lower().endswith(ext) for ext in ['.ogg', '.mp3', '.wav', '.m4a', '.opus', '.flac']):
+            # Check if voice translation is on
+            if not channel_audio_settings.get(ch_id, True):
+                continue
             try:
                 audio_bytes = await attachment.read()
                 text = transcribe_audio(audio_bytes, attachment.filename)
@@ -1237,7 +1280,7 @@ async def on_message(message):
         return
 
     flag = LANG_FLAGS.get(tgt, "🌐")
-    embed = discord.Embed(description=f"{flag} {result}", color=0x06C755)
+    embed = discord.Embed(description=safe_embed_text(f"{flag} {result}"), color=0x06C755)
     embed.set_footer(text=f"翻譯 {LANG_NAMES.get(src, src)[:2]} → {LANG_NAMES.get(tgt, tgt)[:2]}")
     view = TranslateView(text, src, tgt)
 
@@ -1278,6 +1321,10 @@ async def cmd_help(interaction: discord.Interaction):
     embed.add_field(name="🌐 /lang 🔒", value="頻道語言（管理員）", inline=True)
     embed.add_field(name="🔇 /skip 🔒", value="跳過翻譯（管理員）", inline=True)
     embed.add_field(name="⏸️ /toggle 🔒", value="開關翻譯（管理員）", inline=True)
+    embed.add_field(name="🖼️ /img 🔒", value="開關圖片翻譯", inline=True)
+    embed.add_field(name="🎤 /voice 🔒", value="開關語音翻譯", inline=True)
+    embed.add_field(name="📋 /wo 🔒", value="開關工單偵測", inline=True)
+    embed.add_field(name="📃 /skiplist", value="查看跳過名單", inline=True)
     embed.add_field(name="📊 /stats", value="使用統計", inline=True)
     embed.add_field(name="ℹ️ /status", value="頻道設定", inline=True)
     embed.set_footer(text="🔒=管理員限定 | 華新麗華鹽水廠 不鏽鋼事業部")
@@ -1505,6 +1552,68 @@ async def cmd_toggle(interaction: discord.Interaction):
     await interaction.response.send_message(f"翻譯已{status}")
 
 
+@bot.tree.command(name="img", description="開關本頻道的圖片翻譯（管理員）")
+@app_commands.choices(switch=[
+    app_commands.Choice(name="開啟", value="on"),
+    app_commands.Choice(name="關閉", value="off"),
+])
+async def cmd_img(interaction: discord.Interaction, switch: app_commands.Choice[str]):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ 需要管理員權限", ephemeral=True)
+        return
+    channel_img_settings[interaction.channel_id] = (switch.value == "on")
+    status = "開啟 ✅" if switch.value == "on" else "關閉 ❌"
+    usage_stats["slash_commands"] += 1
+    await interaction.response.send_message(f"🖼️ 圖片翻譯已{status}")
+
+
+@bot.tree.command(name="voice", description="開關本頻道的語音翻譯（管理員）")
+@app_commands.choices(switch=[
+    app_commands.Choice(name="開啟", value="on"),
+    app_commands.Choice(name="關閉", value="off"),
+])
+async def cmd_voice(interaction: discord.Interaction, switch: app_commands.Choice[str]):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ 需要管理員權限", ephemeral=True)
+        return
+    channel_audio_settings[interaction.channel_id] = (switch.value == "on")
+    status = "開啟 ✅" if switch.value == "on" else "關閉 ❌"
+    usage_stats["slash_commands"] += 1
+    await interaction.response.send_message(f"🎤 語音翻譯已{status}")
+
+
+@bot.tree.command(name="wo", description="開關本頻道的工單偵測（管理員）")
+@app_commands.choices(switch=[
+    app_commands.Choice(name="開啟", value="on"),
+    app_commands.Choice(name="關閉", value="off"),
+])
+async def cmd_wo(interaction: discord.Interaction, switch: app_commands.Choice[str]):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ 需要管理員權限", ephemeral=True)
+        return
+    channel_wo_settings[interaction.channel_id] = (switch.value == "on")
+    status = "開啟 ✅" if switch.value == "on" else "關閉 ❌"
+    usage_stats["slash_commands"] += 1
+    await interaction.response.send_message(f"📋 工單偵測已{status}")
+
+
+@bot.tree.command(name="skiplist", description="查看本頻道被跳過翻譯的使用者")
+async def cmd_skiplist(interaction: discord.Interaction):
+    ch_id = interaction.channel_id
+    skipped = channel_skip_users.get(ch_id, set())
+    if not skipped:
+        await interaction.response.send_message("✅ 目前沒有被跳過的使用者", ephemeral=True)
+        return
+    lines = []
+    for uid in skipped:
+        member = interaction.guild.get_member(uid) if interaction.guild else None
+        name = member.display_name if member else str(uid)
+        lines.append(f"• {name}")
+    embed = discord.Embed(title="🔇 跳過翻譯名單", description="\n".join(lines), color=0x06C755)
+    usage_stats["slash_commands"] += 1
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @bot.tree.command(name="stats", description="查看翻譯使用統計")
 async def cmd_stats(interaction: discord.Interaction):
     uptime_sec = time.time() - usage_stats["start_time"]
@@ -1651,7 +1760,20 @@ select{width:100%;padding:10px;border-radius:8px;background:#1a1a1a;color:#fff;b
 <!-- Storage -->
 <div class="panel" id="panel-storage">
 <div class="card">
-<div class="card-title">📦 儲區資料</div>
+<div class="card-title">📦 儲區資料更新</div>
+<div class="card-sub">上傳 Excel 檔案自動更新儲區查詢資料</div>
+<div style="margin-top:12px">
+<input type="file" id="storageFile" accept=".xlsx,.xls" style="display:none" onchange="previewStorage()">
+<button class="btn btn-purple" onclick="document.getElementById('storageFile').click()">選擇 Excel 檔案</button>
+<div id="storageFileName" style="margin-top:8px;font-size:13px;color:#888"></div>
+</div>
+</div>
+<div id="storagePreview"></div>
+<div id="storageActions" style="display:none;margin-top:12px">
+<button class="btn btn-green" onclick="uploadStorage()">確認更新</button>
+</div>
+<div class="card" style="margin-top:12px">
+<div class="card-title">目前資料</div>
 <div id="storageStats"><div class="empty">載入中...</div></div>
 <div style="margin-top:10px">
 <button class="btn btn-sm" style="background:#333;color:#fff" onclick="downloadJson()">下載 JSON</button>
@@ -1719,9 +1841,16 @@ async function loadChannels(){
     <div class="card">
       <div class="card-title">
         <span>#${c.name} <span style="color:#666;font-size:11px">${c.guild}</span></span>
-        <span class="badge ${c.translation_on?'badge-on':'badge-off'}">${c.translation_on?'翻譯開':'翻譯關'}</span>
+        <span class="badge ${c.translation_on?'badge-on':'badge-off'}" style="cursor:pointer" onclick="toggleCh('${c.id}')">${c.translation_on?'翻譯開':'翻譯關'}</span>
       </div>
-      <div class="card-sub">語言: ${c.target_lang} ｜跳過: ${c.skip_count}人</div>
+      <div class="card-sub">語言: <select style="display:inline;width:auto;padding:2px 6px;font-size:11px;margin:0" onchange="setChLang('${c.id}',this.value)">
+        <option value="id" ${c.target_lang==='id'?'selected':''}>印尼</option>
+        <option value="en" ${c.target_lang==='en'?'selected':''}>英文</option>
+        <option value="vi" ${c.target_lang==='vi'?'selected':''}>越南</option>
+        <option value="th" ${c.target_lang==='th'?'selected':''}>泰文</option>
+        <option value="ja" ${c.target_lang==='ja'?'selected':''}>日文</option>
+        <option value="ko" ${c.target_lang==='ko'?'selected':''}>韓文</option>
+      </select> ｜跳過: ${c.skip_count}人</div>
     </div>
   `).join('');
 }
@@ -1734,14 +1863,50 @@ async function loadUsers(){
   el.innerHTML=d.users.map(u=>`
     <div class="card">
       <div class="card-title"><span>${u.name}</span><span class="badge badge-on">${u.lang}</span></div>
+      <div class="card-sub">ID: ${u.id}</div>
     </div>
   `).join('');
+}
+
+async function toggleCh(chId){
+  const d=await api('/channel/toggle','POST',{channel_id:chId});
+  if(d&&d.ok){toast(d.translation_on?'翻譯已開':'翻譯已關');loadChannels()}
+}
+
+async function setChLang(chId,lang){
+  const d=await api('/channel/lang','POST',{channel_id:chId,lang:lang});
+  if(d&&d.ok){toast('語言已切換: '+lang)}
 }
 
 async function loadStorage(){
   const d=await api('/storage');
   if(!d)return;
   document.getElementById('storageStats').innerHTML='<div style="font-size:14px">客戶數: <b>'+d.count+'</b></div>';
+}
+
+let storageFileData=null;
+function previewStorage(){
+  const f=document.getElementById('storageFile').files[0];
+  if(!f)return;
+  document.getElementById('storageFileName').textContent='📄 '+f.name;
+  storageFileData=f;
+  document.getElementById('storageActions').style.display='block';
+  document.getElementById('storagePreview').innerHTML='<div class="card"><div class="card-sub">點「確認更新」上傳並解析</div></div>';
+}
+
+async function uploadStorage(){
+  if(!storageFileData){toast('請先選擇檔案');return}
+  const fd=new FormData();
+  fd.append('file',storageFileData);
+  try{
+    const r=await fetch(API+'/storage/upload',{method:'POST',headers:{'X-Admin-Key':KEY},body:fd});
+    const d=await r.json();
+    if(d.error){toast(d.error);return}
+    toast(d.message||'更新成功');
+    document.getElementById('storageActions').style.display='none';
+    document.getElementById('storagePreview').innerHTML='<div class="card"><div style="color:#06C755;font-weight:600">✅ 已更新 '+d.count+' 筆客戶資料</div></div>';
+    loadStorage();
+  }catch(e){toast('上傳失敗: '+e)}
 }
 
 async function downloadJson(){
@@ -1885,6 +2050,170 @@ async def api_admin_storage_json(request):
         headers={"Content-Disposition": "attachment; filename=storage_data.json"}
     )
 
+async def api_admin_storage_upload(request):
+    global STORAGE_LOOKUP, CUSTOMER_NAMES
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        reader = await request.multipart()
+        field = await reader.next()
+        if not field or field.name != 'file':
+            return web.json_response({"error": "沒有檔案"}, status=400)
+        data = await field.read()
+        if not data:
+            return web.json_response({"error": "空的檔案"}, status=400)
+
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return web.json_response({"error": "空的 Excel"}, status=400)
+
+        header = [str(c).strip() if c else "" for c in rows[0]]
+        new_data = {}
+
+        # Auto-detect format
+        len_cols = {}
+        for i, h in enumerate(header):
+            hl = h.replace(" ", "")
+            if "<=3200" in hl and ">3200" not in hl:
+                len_cols["<=3200"] = i
+            elif ">3200" in hl and "<=4200" in hl:
+                len_cols[">3200<=4200"] = i
+            elif ">4200" in hl:
+                len_cols[">4200"] = i
+
+        if len(len_cols) >= 2:
+            cust_col = 0
+            for _, row in enumerate(rows[1:], 1):
+                if not row or not row[cust_col]:
+                    continue
+                cust = str(row[cust_col]).strip()
+                if not cust:
+                    continue
+                entries = []
+                for length_key, col_idx in len_cols.items():
+                    if col_idx < len(row) and row[col_idx]:
+                        zone = str(row[col_idx]).strip()
+                        if zone:
+                            entries.append([length_key, zone])
+                if entries:
+                    new_data[cust] = entries
+        else:
+            for row in rows[1:]:
+                if not row or len(row) < 3:
+                    continue
+                cust = str(row[0]).strip() if row[0] else ""
+                length_key = str(row[1]).strip() if row[1] else ""
+                zone = str(row[2]).strip() if row[2] else ""
+                if cust and length_key and zone:
+                    if cust not in new_data:
+                        new_data[cust] = []
+                    new_data[cust].append([length_key, zone])
+
+        if not new_data:
+            return web.json_response({"error": "無法解析 Excel，請確認格式"}, status=400)
+
+        STORAGE_LOOKUP = new_data
+        CUSTOMER_NAMES = sorted(list(set(list(STORAGE_LOOKUP.keys()) + EXTRA_CUSTOMERS)), key=lambda x: -len(x))
+        logger.info("Storage updated via admin: %d customers", len(new_data))
+
+        # Auto-commit to GitHub
+        json_str = json.dumps(new_data, ensure_ascii=False, indent=2)
+        gh_ok = commit_storage_to_github(json_str)
+        msg = f"已更新 {len(new_data)} 筆客戶"
+        if gh_ok:
+            msg += "（已自動推送 GitHub）"
+        else:
+            msg += "（GitHub 推送失敗，僅暫時生效）"
+
+        return web.json_response({"ok": True, "count": len(new_data), "github": gh_ok, "message": msg})
+    except Exception as e:
+        logger.error("Storage upload error: %s", e)
+        return web.json_response({"error": f"解析失敗: {str(e)}"}, status=400)
+
+
+def commit_storage_to_github(json_data):
+    """Auto-commit storage_data.json to GitHub repo."""
+    if not GITHUB_TOKEN:
+        logger.warning("No GITHUB_TOKEN, skipping GitHub commit")
+        return False
+    try:
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/storage_data.json"
+        req = urllib.request.Request(api_url, headers={
+            "Authorization": "token " + GITHUB_TOKEN,
+            "Accept": "application/vnd.github.v3+json"
+        })
+        sha = None
+        try:
+            with urllib.request.urlopen(req) as resp:
+                existing = json.loads(resp.read().decode())
+                sha = existing.get("sha")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+        content_b64 = base64.b64encode(json_data.encode("utf-8")).decode("utf-8")
+        body = {"message": "Update storage data via admin panel", "content": content_b64, "branch": "main"}
+        if sha:
+            body["sha"] = sha
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(api_url, data=data, method="PUT", headers={
+            "Authorization": "token " + GITHUB_TOKEN,
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json"
+        })
+        with urllib.request.urlopen(req) as resp:
+            logger.info("Storage committed to GitHub successfully")
+            return True
+    except Exception as e:
+        logger.error("GitHub commit failed: %s", e)
+        return False
+
+
+# ─── Admin API: channel/user management ──────────────────
+async def api_admin_channel_toggle(request):
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    data = await request.json()
+    ch_id = int(data.get("channel_id", 0))
+    if not ch_id:
+        return web.json_response({"error": "missing channel_id"}, status=400)
+    current = channel_settings.get(ch_id, True)
+    channel_settings[ch_id] = not current
+    return web.json_response({"ok": True, "translation_on": not current})
+
+async def api_admin_channel_lang(request):
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    data = await request.json()
+    ch_id = int(data.get("channel_id", 0))
+    lang = data.get("lang", "id")
+    if not ch_id:
+        return web.json_response({"error": "missing channel_id"}, status=400)
+    channel_target_lang[ch_id] = lang
+    return web.json_response({"ok": True, "lang": lang})
+
+async def api_admin_user_skip(request):
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    data = await request.json()
+    uid = int(data.get("user_id", 0))
+    ch_id = int(data.get("channel_id", 0))
+    if not uid:
+        return web.json_response({"error": "missing user_id"}, status=400)
+    # Toggle in all channels or specific channel
+    if ch_id:
+        if ch_id not in channel_skip_users:
+            channel_skip_users[ch_id] = set()
+        if uid in channel_skip_users[ch_id]:
+            channel_skip_users[ch_id].discard(uid)
+            return web.json_response({"ok": True, "skipped": False})
+        else:
+            channel_skip_users[ch_id].add(uid)
+            return web.json_response({"ok": True, "skipped": True})
+    return web.json_response({"ok": True})
+
 async def manifest_handler(request):
     return web.Response(text=DC_MANIFEST, content_type="application/manifest+json")
 
@@ -1909,6 +2238,10 @@ async def start_web_server():
     app.router.add_get("/api/admin/users", api_admin_users)
     app.router.add_get("/api/admin/storage", api_admin_storage)
     app.router.add_get("/api/admin/storage/json", api_admin_storage_json)
+    app.router.add_post("/api/admin/storage/upload", api_admin_storage_upload)
+    app.router.add_post("/api/admin/channel/toggle", api_admin_channel_toggle)
+    app.router.add_post("/api/admin/channel/lang", api_admin_channel_lang)
+    app.router.add_post("/api/admin/user/skip", api_admin_user_skip)
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
     await runner.setup()
