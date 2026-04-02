@@ -16,6 +16,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from openai import OpenAI
+from aiohttp import web
 
 # ─── Config ─────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -809,9 +810,29 @@ async def cmd_term(interaction: discord.Interaction, keyword: str):
     await interaction.response.send_message(embed=embed)
 
 
+# ─── Health endpoint (keeps Render free tier alive) ─────
+async def health_handler(request):
+    return web.Response(text='{"status":"ok"}', content_type="application/json")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/health", health_handler)
+    app.router.add_get("/", health_handler)
+    port = int(os.environ.get("PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Web server started on port {port}")
+
 # ─── Run ────────────────────────────────────────────────
-if __name__ == "__main__":
+async def main():
     if not DISCORD_TOKEN:
         logger.error("DISCORD_TOKEN not set!")
         exit(1)
-    bot.run(DISCORD_TOKEN)
+    await start_web_server()
+    async with bot:
+        await bot.start(DISCORD_TOKEN)
+
+if __name__ == "__main__":
+    asyncio.run(main())
