@@ -1395,6 +1395,13 @@ async def cmd_help(interaction: discord.Interaction):
     embed.add_field(name="📦 /qry <客戶>", value="儲區查詢（自動補全）", inline=True)
     embed.add_field(name="🔍 /search <字>", value="模糊搜尋客戶儲區", inline=True)
     embed.add_field(name="📖 /term <字>", value="工廠術語查詢", inline=True)
+    embed.add_field(name="📷📝 相簿＆筆記本", value=(
+        "• `/setup_album` — 建立相簿頻道 🔒\n"
+        "• `/setup_notebook` — 建立筆記本（Forum）🔒\n"
+        "• `/album_new <名稱>` — 建立子相簿\n"
+        "• `/album_list` — 查看所有子相簿\n"
+        "• `/note <標題> <內容>` — 建立雙語筆記"
+    ), inline=False)
     embed.add_field(name="📢 /notice <訊息>", value="雙語公告", inline=True)
     embed.add_field(name="📌 /pin <訊息>", value="雙語公告釘選 🔒", inline=True)
     embed.add_field(name="📝 /handover", value="交班雙語模板", inline=True)
@@ -1751,6 +1758,392 @@ async def cmd_term(interaction: discord.Interaction, keyword: str):
     embed = discord.Embed(title=f"📖 術語查詢：{keyword}", description="\n".join(display), color=0x06C755)
     usage_stats["slash_commands"] += 1
     await interaction.response.send_message(embed=embed)
+
+
+# ─── Album & Notebook (相簿 & 筆記本) ────────────────────
+
+# Track created channels per guild
+album_channels = {}    # {guild_id: channel_id}
+notebook_channels = {} # {guild_id: channel_id}
+
+NOTEBOOK_TAGS = [
+    {"name": "📢 公告 Pengumuman", "emoji": "📢"},
+    {"name": "📋 SOP", "emoji": "📋"},
+    {"name": "🔧 設備 Mesin", "emoji": "🔧"},
+    {"name": "📦 生產 Produksi", "emoji": "📦"},
+    {"name": "⚠️ 異常 Masalah", "emoji": "⚠️"},
+    {"name": "📝 會議 Rapat", "emoji": "📝"},
+    {"name": "💡 其他 Lainnya", "emoji": "💡"},
+]
+
+
+@bot.tree.command(name="setup_album", description="建立相簿頻道（管理員）")
+@app_commands.describe(name="頻道名稱（預設：相簿-album）")
+async def cmd_setup_album(interaction: discord.Interaction, name: str = "相簿-album"):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ 需要管理員權限", ephemeral=True)
+        return
+    await interaction.response.defer()
+    guild = interaction.guild
+
+    # Check if album channel already exists
+    existing = discord.utils.get(guild.text_channels, name=name)
+    if existing:
+        album_channels[guild.id] = existing.id
+        await interaction.followup.send(
+            f"⚠️ 頻道 {existing.mention} 已存在，已設為相簿頻道",
+        )
+        return
+
+    try:
+        # Find or create a category
+        category = discord.utils.get(guild.categories, name="📁 相簿＆筆記")
+        if not category:
+            category = await guild.create_category("📁 相簿＆筆記")
+
+        # Create album channel with topic & slowmode
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                send_messages=True,
+                attach_files=True,
+                embed_links=True,
+                read_messages=True,
+            ),
+            guild.me: discord.PermissionOverwrite(
+                send_messages=True,
+                manage_channels=True,
+                manage_threads=True,
+            ),
+        }
+
+        channel = await guild.create_text_channel(
+            name=name,
+            category=category,
+            topic="📷 相簿頻道 — 上傳照片到這裡！用 /album_new 建立子相簿\n📷 Album — Upload foto di sini! Pakai /album_new untuk sub-album",
+            overwrites=overwrites,
+            slowmode_delay=0,
+        )
+        album_channels[guild.id] = channel.id
+
+        # Send welcome message
+        embed = discord.Embed(
+            title="📷 相簿 / Album",
+            description=(
+                "歡迎使用相簿頻道！\nSelamat datang di channel album!\n\n"
+                "📸 **直接上傳照片** — 照片會集中在這裡\n"
+                "📂 **子相簿** — 用 `/album_new 名稱` 建立分類\n"
+                "🔍 **找照片** — 點右上角「媒體」瀏覽所有圖片\n\n"
+                "📸 **Upload foto langsung** — Foto dikumpulkan di sini\n"
+                "📂 **Sub-album** — Pakai `/album_new nama` untuk kategori\n"
+                "🔍 **Cari foto** — Klik \"Media\" di kanan atas"
+            ),
+            color=0x06C755,
+        )
+        await channel.send(embed=embed)
+
+        await interaction.followup.send(
+            f"✅ 相簿頻道已建立：{channel.mention}\n"
+            f"📷 大家可以直接上傳照片\n"
+            f"📂 用 `/album_new` 建立子相簿（討論串）"
+        )
+    except Exception as e:
+        logger.error(f"Setup album error: {e}")
+        await interaction.followup.send(f"❌ 建立失敗：{e}")
+    usage_stats["slash_commands"] += 1
+
+
+@bot.tree.command(name="setup_notebook", description="建立筆記本頻道 — Forum（管理員）")
+@app_commands.describe(name="頻道名稱（預設：筆記本-notes）")
+async def cmd_setup_notebook(interaction: discord.Interaction, name: str = "筆記本-notes"):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ 需要管理員權限", ephemeral=True)
+        return
+    await interaction.response.defer()
+    guild = interaction.guild
+
+    # Check if forum channel already exists
+    for ch in guild.forums:
+        if ch.name == name:
+            notebook_channels[guild.id] = ch.id
+            await interaction.followup.send(
+                f"⚠️ 論壇頻道 {ch.mention} 已存在，已設為筆記本頻道"
+            )
+            return
+
+    try:
+        # Find or create category
+        category = discord.utils.get(guild.categories, name="📁 相簿＆筆記")
+        if not category:
+            category = await guild.create_category("📁 相簿＆筆記")
+
+        # Create forum channel with tags
+        available_tags = []
+        for tag_info in NOTEBOOK_TAGS:
+            available_tags.append(
+                discord.ForumTag(name=tag_info["name"])
+            )
+
+        channel = await guild.create_forum(
+            name=name,
+            category=category,
+            topic="📝 筆記本 — 文字、影片、重要資訊都放這裡！用 /note 快速建立筆記\n📝 Catatan — Tulis, video, info penting taruh di sini! Pakai /note untuk buat catatan",
+            available_tags=available_tags,
+            default_sort_order=discord.ForumOrderType.latest_activity,
+        )
+        notebook_channels[guild.id] = channel.id
+
+        # Create a welcome/instruction post
+        welcome_embed = discord.Embed(
+            title="📝 筆記本使用說明 / Cara Pakai",
+            description=(
+                "**中文：**\n"
+                "1️⃣ 點「新貼文」或用 `/note` 指令建立筆記\n"
+                "2️⃣ 可以附加影片、圖片、檔案\n"
+                "3️⃣ 選擇標籤分類（公告、SOP、設備...）\n"
+                "4️⃣ 大家可以在筆記下方回覆補充\n\n"
+                "**Indonesia:**\n"
+                "1️⃣ Klik \"Post Baru\" atau pakai `/note` untuk buat catatan\n"
+                "2️⃣ Bisa lampirkan video, foto, file\n"
+                "3️⃣ Pilih tag kategori (Pengumuman, SOP, Mesin...)\n"
+                "4️⃣ Semua bisa balas dan tambah info di bawah catatan"
+            ),
+            color=0x06C755,
+        )
+        # Find a tag for the welcome post
+        guide_tag = None
+        for t in channel.available_tags:
+            if "其他" in t.name or "Lainnya" in t.name:
+                guide_tag = t
+                break
+
+        applied_tags = [guide_tag] if guide_tag else []
+        await channel.create_thread(
+            name="📖 使用說明 Panduan",
+            embed=welcome_embed,
+            applied_tags=applied_tags,
+        )
+
+        await interaction.followup.send(
+            f"✅ 筆記本頻道已建立：{channel.mention}\n"
+            f"📝 用 `/note` 快速建立筆記\n"
+            f"🏷️ 內建標籤：公告、SOP、設備、生產、異常、會議、其他"
+        )
+    except discord.Forbidden:
+        await interaction.followup.send("❌ Bot 權限不足，需要「管理頻道」權限")
+    except Exception as e:
+        logger.error(f"Setup notebook error: {e}")
+        await interaction.followup.send(f"❌ 建立失敗：{e}")
+    usage_stats["slash_commands"] += 1
+
+
+@bot.tree.command(name="album_new", description="在相簿建立子相簿（討論串）")
+@app_commands.describe(
+    name="子相簿名稱（例：12月設備檢修）",
+    description="說明（可選）",
+)
+async def cmd_album_new(interaction: discord.Interaction, name: str, description: str = ""):
+    guild = interaction.guild
+    album_ch_id = album_channels.get(guild.id)
+
+    # If not setup yet, try to find by name
+    if not album_ch_id:
+        for ch in guild.text_channels:
+            if "相簿" in ch.name or "album" in ch.name.lower():
+                album_ch_id = ch.id
+                album_channels[guild.id] = ch.id
+                break
+
+    if not album_ch_id:
+        await interaction.response.send_message(
+            "❌ 尚未建立相簿頻道，請管理員先執行 `/setup_album`",
+            ephemeral=True,
+        )
+        return
+
+    channel = bot.get_channel(album_ch_id)
+    if not channel:
+        await interaction.response.send_message("❌ 找不到相簿頻道", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    try:
+        desc_text = description or f"📷 {name}"
+        # Translate name for bilingual header
+        src = detect_language(name) or "zh"
+        tgt = "id" if src == "zh" else "zh"
+        translated_name = translate(name, src, tgt) or ""
+
+        thread_title = f"📂 {name}"
+        if translated_name and translated_name != name:
+            thread_title = f"📂 {name} / {translated_name}"
+
+        # Truncate if too long for Discord (100 char limit)
+        if len(thread_title) > 100:
+            thread_title = thread_title[:97] + "..."
+
+        embed = discord.Embed(
+            title=thread_title,
+            description=f"{desc_text}\n\n📸 在這個討論串上傳照片\n📸 Upload foto di thread ini",
+            color=0x06C755,
+        )
+        embed.set_footer(text=f"建立者：{interaction.user.display_name}")
+
+        msg = await channel.send(embed=embed)
+        thread = await msg.create_thread(name=thread_title[:100])
+
+        await interaction.followup.send(
+            f"✅ 子相簿已建立：{thread.mention}\n📸 在裡面上傳照片就好！"
+        )
+    except Exception as e:
+        logger.error(f"Album new error: {e}")
+        await interaction.followup.send(f"❌ 建立失敗：{e}")
+    usage_stats["slash_commands"] += 1
+
+
+class NoteTagSelect(discord.ui.View):
+    """Select tag for a new note."""
+    def __init__(self, title, content, author, forum_channel):
+        super().__init__(timeout=60)
+        self.title = title
+        self.content = content
+        self.author = author
+        self.forum_channel = forum_channel
+
+    @discord.ui.select(
+        placeholder="選擇分類標籤 / Pilih tag...",
+        options=[
+            discord.SelectOption(label="📢 公告 Pengumuman", value="📢 公告 Pengumuman"),
+            discord.SelectOption(label="📋 SOP", value="📋 SOP"),
+            discord.SelectOption(label="🔧 設備 Mesin", value="🔧 設備 Mesin"),
+            discord.SelectOption(label="📦 生產 Produksi", value="📦 生產 Produksi"),
+            discord.SelectOption(label="⚠️ 異常 Masalah", value="⚠️ 異常 Masalah"),
+            discord.SelectOption(label="📝 會議 Rapat", value="📝 會議 Rapat"),
+            discord.SelectOption(label="💡 其他 Lainnya", value="💡 其他 Lainnya"),
+        ],
+    )
+    async def tag_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        await interaction.response.defer(ephemeral=True)
+        tag_name = select.values[0]
+        try:
+            # Find matching tag
+            applied_tags = []
+            for t in self.forum_channel.available_tags:
+                if t.name == tag_name:
+                    applied_tags.append(t)
+                    break
+
+            # Translate content
+            src = detect_language(self.content) or "zh"
+            tgt = "id" if src == "zh" else "zh"
+            translated = translate(self.content, src, tgt) or ""
+
+            embed = discord.Embed(color=0x06C755)
+            src_flag = LANG_FLAGS.get(src, "")
+            tgt_flag = LANG_FLAGS.get(tgt, "")
+            embed.add_field(name=f"{src_flag} 內容", value=self.content[:1024], inline=False)
+            if translated:
+                embed.add_field(name=f"{tgt_flag} 翻譯", value=translated[:1024], inline=False)
+            embed.set_footer(text=f"筆記者：{self.author.display_name} | {time.strftime('%Y-%m-%d %H:%M')}")
+
+            thread_with_msg = await self.forum_channel.create_thread(
+                name=self.title[:100],
+                embed=embed,
+                applied_tags=applied_tags,
+            )
+
+            await interaction.followup.send(
+                f"✅ 筆記已建立：{thread_with_msg.thread.mention}\n"
+                f"🏷️ 標籤：{tag_name}\n"
+                f"💡 可以在筆記裡繼續上傳影片和圖片！",
+                ephemeral=True,
+            )
+        except Exception as e:
+            logger.error(f"Note creation error: {e}")
+            await interaction.followup.send(f"❌ 建立失敗：{e}", ephemeral=True)
+
+
+@bot.tree.command(name="note", description="在筆記本建立新筆記（雙語）")
+@app_commands.describe(
+    title="筆記標題",
+    content="筆記內容（文字）",
+)
+async def cmd_note(interaction: discord.Interaction, title: str, content: str):
+    guild = interaction.guild
+    nb_ch_id = notebook_channels.get(guild.id)
+
+    # Try to find by name
+    if not nb_ch_id:
+        for ch in guild.forums:
+            if "筆記" in ch.name or "note" in ch.name.lower():
+                nb_ch_id = ch.id
+                notebook_channels[guild.id] = ch.id
+                break
+
+    if not nb_ch_id:
+        await interaction.response.send_message(
+            "❌ 尚未建立筆記本頻道，請管理員先執行 `/setup_notebook`",
+            ephemeral=True,
+        )
+        return
+
+    forum_channel = bot.get_channel(nb_ch_id)
+    if not forum_channel or not isinstance(forum_channel, discord.ForumChannel):
+        await interaction.response.send_message("❌ 找不到筆記本頻道", ephemeral=True)
+        return
+
+    # Show tag selector
+    view = NoteTagSelect(title, content, interaction.user, forum_channel)
+    usage_stats["slash_commands"] += 1
+    await interaction.response.send_message(
+        f"📝 **{title}**\n選擇分類標籤：",
+        view=view,
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="album_list", description="查看所有子相簿")
+async def cmd_album_list(interaction: discord.Interaction):
+    guild = interaction.guild
+    album_ch_id = album_channels.get(guild.id)
+
+    if not album_ch_id:
+        for ch in guild.text_channels:
+            if "相簿" in ch.name or "album" in ch.name.lower():
+                album_ch_id = ch.id
+                album_channels[guild.id] = ch.id
+                break
+
+    if not album_ch_id:
+        await interaction.response.send_message("❌ 尚未建立相簿頻道", ephemeral=True)
+        return
+
+    channel = bot.get_channel(album_ch_id)
+    if not channel:
+        await interaction.response.send_message("❌ 找不到相簿頻道", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    threads = []
+    for thread in channel.threads:
+        threads.append(f"📂 {thread.mention} ({thread.message_count} 則)")
+
+    # Also check archived threads
+    async for thread in channel.archived_threads(limit=20):
+        threads.append(f"📂 {thread.mention} ({thread.message_count} 則) 📦已封存")
+
+    if not threads:
+        await interaction.followup.send("📷 尚無子相簿，用 `/album_new` 建立第一個！", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="📷 子相簿列表 / Daftar Sub-Album",
+        description="\n".join(threads[:25]),
+        color=0x06C755,
+    )
+    if len(threads) > 25:
+        embed.set_footer(text=f"還有 {len(threads) - 25} 個未顯示")
+    usage_stats["slash_commands"] += 1
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ─── Admin Panel HTML ────────────────────────────────────
