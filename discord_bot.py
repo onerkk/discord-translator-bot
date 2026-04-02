@@ -1377,15 +1377,21 @@ async def cmd_help(interaction: discord.Interaction):
         description="華新麗華鹽水廠 — 多語翻譯機器人",
         color=0x06C755
     )
-    embed.add_field(name="💬 自動翻譯", value="頻道打字自動翻譯＋按鈕切換語言", inline=False)
-    embed.add_field(name="🏳️ 旗幟反應翻譯", value="對訊息加 🇮🇩🇹🇼🇬🇧🇻🇳🇹🇭🇯🇵🇰🇷 翻譯", inline=False)
-    embed.add_field(name="📋 右鍵翻譯", value="長按訊息 → 應用程式 → **翻譯這段**", inline=False)
-    embed.add_field(name="💬 私訊翻譯", value="直接私訊 bot 翻譯", inline=False)
-    embed.add_field(name="🖼️ 圖片翻譯", value="上傳圖片自動 OCR 翻譯", inline=False)
-    embed.add_field(name="🎤 語音翻譯", value="上傳語音檔 Whisper 辨識翻譯", inline=False)
-    embed.add_field(name="📋 工單偵測", value="上傳製造指示書自動查儲區", inline=False)
-    embed.add_field(name="👋 歡迎訊息", value="新成員加入自動雙語歡迎", inline=False)
-    embed.add_field(name="🏷️ 自動角色", value="偵測語言自動分配語言角色", inline=False)
+    embed.add_field(name="💬 翻譯功能", value=(
+        "• 頻道打字自動翻譯＋按鈕切換語言\n"
+        "• 對訊息加 🇮🇩🇹🇼🇬🇧🇻🇳🇹🇭🇯🇵🇰🇷 旗幟反應翻譯\n"
+        "• 長按訊息 → 應用程式 → **翻譯這段**\n"
+        "• 直接私訊 bot 翻譯"
+    ), inline=False)
+    embed.add_field(name="🖼️ 媒體 & 偵測", value=(
+        "• 上傳圖片自動 OCR 翻譯\n"
+        "• 上傳語音檔 Whisper 辨識翻譯\n"
+        "• 上傳製造指示書自動查儲區"
+    ), inline=False)
+    embed.add_field(name="🤖 自動化", value=(
+        "• 新成員加入自動雙語歡迎\n"
+        "• 偵測語言自動分配語言角色"
+    ), inline=False)
     embed.add_field(name="📦 /qry <客戶>", value="儲區查詢（自動補全）", inline=True)
     embed.add_field(name="🔍 /search <字>", value="模糊搜尋客戶儲區", inline=True)
     embed.add_field(name="📖 /term <字>", value="工廠術語查詢", inline=True)
