@@ -1770,7 +1770,6 @@ ADMIN_HTML = '''<!DOCTYPE html>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#e0e0e0;min-height:100vh}
 .header{background:linear-gradient(135deg,#5865F2,#7289DA);padding:16px;font-size:18px;font-weight:700;display:flex;align-items:center;gap:8px}
-.header img{width:28px;height:28px;border-radius:50%}
 #loginPage{padding:20px;max-width:400px;margin:40px auto}
 #loginPage h2{margin-bottom:16px;text-align:center}
 #mainPage{display:none}
@@ -1781,7 +1780,7 @@ input[type=password],input[type=text]{width:100%;padding:12px;border:1px solid #
 .btn-red{background:#d93025;color:#fff}
 .btn-sm{padding:6px 12px;font-size:12px}
 .tabs{display:flex;overflow-x:auto;background:#111;border-bottom:2px solid #222}
-.tab{padding:12px 16px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;color:#888;border-bottom:2px solid transparent;margin-bottom:-2px}
+.tab{padding:12px 14px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;color:#888;border-bottom:2px solid transparent;margin-bottom:-2px}
 .tab.active{color:#5865F2;border-bottom-color:#5865F2}
 .panel{display:none;padding:12px}
 .panel.active{display:block}
@@ -1804,8 +1803,11 @@ input[type=password],input[type=text]{width:100%;padding:12px;border:1px solid #
 .slider::before{content:"";position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s}
 .toggle input:checked+.slider{background:#5865F2}
 .toggle input:checked+.slider::before{transform:translateX(20px)}
-.wl-item{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #222}
 select{width:100%;padding:10px;border-radius:8px;background:#1a1a1a;color:#fff;border:1px solid #333;font-size:14px;margin-bottom:8px}
+.wl-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #222}
+.wl-row:last-child{border-bottom:none}
+.wl-name{font-size:14px}
+.wl-hint{font-size:11px;color:#888;margin-top:6px}
 </style>
 </head>
 <body>
@@ -1821,6 +1823,7 @@ select{width:100%;padding:10px;border-radius:8px;background:#1a1a1a;color:#fff;b
 <div class="tabs">
 <div class="tab active" onclick="switchTab('dash')">總覽</div>
 <div class="tab" onclick="switchTab('channels')">頻道</div>
+<div class="tab" onclick="switchTab('whitelist')">白名單</div>
 <div class="tab" onclick="switchTab('users')">使用者</div>
 <div class="tab" onclick="switchTab('storage')">儲區</div>
 </div>
@@ -1833,6 +1836,17 @@ select{width:100%;padding:10px;border-radius:8px;background:#1a1a1a;color:#fff;b
 <!-- Channels -->
 <div class="panel" id="panel-channels">
 <div id="channelList"><div class="empty">載入中...</div></div>
+</div>
+
+<!-- Whitelist (skip management) -->
+<div class="panel" id="panel-whitelist">
+<div class="card">
+<select id="wlChannelSelect" onchange="loadWhitelist()">
+<option value="">選擇頻道...</option>
+</select>
+<div class="wl-hint">開啟 = 不翻譯該成員訊息</div>
+</div>
+<div id="wlList"><div class="empty">請先選擇頻道</div></div>
 </div>
 
 <!-- Users -->
@@ -1869,6 +1883,7 @@ select{width:100%;padding:10px;border-radius:8px;background:#1a1a1a;color:#fff;b
 
 <script>
 let KEY='';
+let allChannels=[];
 const API=window.location.origin+'/api/admin';
 
 function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2000)}
@@ -1896,7 +1911,7 @@ function doLogin(){
 }
 
 function switchTab(name){
-  const labels={'dash':'總覽','channels':'頻道','users':'使用者','storage':'儲區'};
+  const labels={'dash':'總覽','channels':'頻道','whitelist':'白名單','users':'使用者','storage':'儲區'};
   document.querySelectorAll('.tab').forEach(t=>{t.classList.toggle('active',t.textContent.includes(labels[name]))});
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.getElementById('panel-'+name).classList.add('active');
@@ -1910,7 +1925,7 @@ async function loadStats(){
   const el=document.getElementById('statsGrid');
   el.innerHTML=Object.entries(d).map(([k,v])=>{
     if(k==='start_time')return '';
-    const labels={'text_translations':'💬 文字翻譯','image_translations':'🖼️ 圖片翻譯','voice_translations':'🎤 語音翻譯','work_orders_detected':'📋 工單偵測','slash_commands':'⌨️ 指令','reaction_translations':'🏳️ 反應翻譯','context_translations':'📋 右鍵翻譯','uptime':'⏱️ 運行時間','cache_count':'📦 快取','customer_count':'👥 客戶','guilds':'🏠 伺服器','channels_active':'📢 活躍頻道','users_known':'👤 已知使用者'};
+    const labels={'text_translations':'💬 文字翻譯','image_translations':'🖼️ 圖片翻譯','voice_translations':'🎤 語音翻譯','work_orders_detected':'📋 工單偵測','slash_commands':'⌨️ 指令','reaction_translations':'🏳️ 反應翻譯','context_translations':'📋 右鍵翻譯','uptime':'⏱️ 運行時間','cache_count':'📦 快取','customer_count':'👥 客戶','guilds':'🏠 伺服器','channels_active':'📢 頻道','users_known':'👤 使用者'};
     return `<div class="stat-box"><div class="stat-num">${v}</div><div class="stat-label">${labels[k]||k}</div></div>`;
   }).join('');
 }
@@ -1918,32 +1933,64 @@ async function loadStats(){
 async function loadChannels(){
   const d=await api('/channels');
   if(!d)return;
+  allChannels=d.channels||[];
   const el=document.getElementById('channelList');
-  if(!d.channels||!d.channels.length){el.innerHTML='<div class="empty">尚無頻道紀錄</div>';return}
-  el.innerHTML=d.channels.map(c=>`
+  if(!allChannels.length){el.innerHTML='<div class="empty">尚無頻道</div>';return}
+  el.innerHTML=allChannels.map(c=>`
     <div class="card">
       <div class="card-title">
         <span>#${c.name} <span style="color:#666;font-size:11px">${c.guild}</span></span>
         <span class="badge ${c.translation_on?'badge-on':'badge-off'}" style="cursor:pointer" onclick="toggleCh('${c.id}')">${c.translation_on?'翻譯開':'翻譯關'}</span>
       </div>
-      <div class="card-sub">語言: <select style="display:inline;width:auto;padding:2px 6px;font-size:11px;margin:0" onchange="setChLang('${c.id}',this.value)">
-        <option value="id" ${c.target_lang==='id'?'selected':''}>印尼</option>
-        <option value="en" ${c.target_lang==='en'?'selected':''}>英文</option>
-        <option value="vi" ${c.target_lang==='vi'?'selected':''}>越南</option>
-        <option value="th" ${c.target_lang==='th'?'selected':''}>泰文</option>
-        <option value="ja" ${c.target_lang==='ja'?'selected':''}>日文</option>
-        <option value="ko" ${c.target_lang==='ko'?'selected':''}>韓文</option>
-      </select> ｜跳過: ${c.skip_count}人
-      ｜🖼️${c.img_on?'✅':'❌'} 🎤${c.voice_on?'✅':'❌'} 📋${c.wo_on?'✅':'❌'}</div>
+      <div class="card-sub">
+        語言: <select style="display:inline;width:auto;padding:2px 6px;font-size:11px;margin:0" onchange="setChLang('${c.id}',this.value)">
+          <option value="id" ${c.target_lang==='id'?'selected':''}>印尼</option>
+          <option value="en" ${c.target_lang==='en'?'selected':''}>英文</option>
+          <option value="vi" ${c.target_lang==='vi'?'selected':''}>越南</option>
+          <option value="th" ${c.target_lang==='th'?'selected':''}>泰文</option>
+          <option value="ja" ${c.target_lang==='ja'?'selected':''}>日文</option>
+          <option value="ko" ${c.target_lang==='ko'?'selected':''}>韓文</option>
+        </select>
+        ｜跳過: ${c.skip_count}人
+        ｜🖼️${c.img_on?'✅':'❌'} 🎤${c.voice_on?'✅':'❌'} 📋${c.wo_on?'✅':'❌'}
+      </div>
     </div>
   `).join('');
+  // Also update whitelist channel dropdown
+  const sel=document.getElementById('wlChannelSelect');
+  const cur=sel.value;
+  sel.innerHTML='<option value="">選擇頻道...</option>'+allChannels.map(c=>`<option value="${c.id}"${c.id===cur?' selected':''}>#${c.name} (${c.guild})</option>`).join('');
+}
+
+async function loadWhitelist(){
+  const chId=document.getElementById('wlChannelSelect').value;
+  const el=document.getElementById('wlList');
+  if(!chId){el.innerHTML='<div class="empty">請先選擇頻道</div>';return}
+  el.innerHTML='<div class="empty">載入中...</div>';
+  const d=await api('/channel/members?channel_id='+chId);
+  if(!d||!d.members){el.innerHTML='<div class="empty">無法載入</div>';return}
+  if(!d.members.length){el.innerHTML='<div class="empty">此頻道沒有成員</div>';return}
+  el.innerHTML='<div class="card">'+d.members.map(m=>`
+    <div class="wl-row">
+      <span class="wl-name">${m.name}</span>
+      <label class="toggle">
+        <input type="checkbox" ${m.skipped?'checked':''} onchange="toggleSkip('${chId}','${m.id}',this.checked)">
+        <span class="slider"></span>
+      </label>
+    </div>
+  `).join('')+'</div>';
+}
+
+async function toggleSkip(chId,uid,checked){
+  const d=await api('/user/skip','POST',{channel_id:chId,user_id:uid});
+  if(d&&d.ok){toast(d.skipped?'已跳過翻譯':'已恢復翻譯');loadChannels()}
 }
 
 async function loadUsers(){
   const d=await api('/users');
   if(!d)return;
   const el=document.getElementById('userList');
-  if(!d.users||!d.users.length){el.innerHTML='<div class="empty">尚無使用者紀錄</div>';return}
+  if(!d.users||!d.users.length){el.innerHTML='<div class="empty">尚無使用者</div>';return}
   el.innerHTML=d.users.map(u=>`
     <div class="card">
       <div class="card-title"><span>${u.name}</span><span class="badge ${u.lang==='—'?'badge-off':'badge-on'}">${u.lang==='—'?'未設定':u.lang}</span></div>
@@ -2384,6 +2431,29 @@ async def api_admin_user_skip(request):
             return web.json_response({"ok": True, "skipped": True})
     return web.json_response({"ok": True})
 
+async def api_admin_channel_members(request):
+    """Get all members for a channel with their skip status."""
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    ch_id = int(request.query.get("channel_id", 0))
+    if not ch_id:
+        return web.json_response({"error": "missing channel_id"}, status=400)
+    members = []
+    if bot.is_ready():
+        channel = bot.get_channel(ch_id)
+        if channel and channel.guild:
+            skip_set = channel_skip_users.get(ch_id, set())
+            for member in channel.guild.members:
+                if member.bot:
+                    continue
+                members.append({
+                    "id": str(member.id),
+                    "name": member.display_name,
+                    "skipped": member.id in skip_set,
+                })
+            members.sort(key=lambda x: x["name"])
+    return web.json_response({"members": members})
+
 async def manifest_handler(request):
     return web.Response(text=DC_MANIFEST, content_type="application/manifest+json")
 
@@ -2420,6 +2490,7 @@ async def start_web_server():
     app.router.add_post("/api/admin/channel/toggle", api_admin_channel_toggle)
     app.router.add_post("/api/admin/channel/lang", api_admin_channel_lang)
     app.router.add_post("/api/admin/user/skip", api_admin_user_skip)
+    app.router.add_get("/api/admin/channel/members", api_admin_channel_members)
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
     await runner.setup()
