@@ -1956,6 +1956,12 @@ async function loadChannels(){
       </div>
     </div>
   `).join('');
+  // Add leave buttons per guild (deduplicated)
+  const guilds=new Map();
+  allChannels.forEach(c=>{if(!guilds.has(c.guild_id))guilds.set(c.guild_id,c.guild)});
+  let leaveHtml='';
+  guilds.forEach((name,id)=>{leaveHtml+=`<div style="margin-top:8px"><button class="btn btn-red btn-sm" onclick="leaveGuild('${id}','${name}')">退出伺服器: ${name}</button></div>`});
+  el.innerHTML+=leaveHtml;
   // Also update whitelist channel dropdown
   const sel=document.getElementById('wlChannelSelect');
   const cur=sel.value;
@@ -2002,6 +2008,13 @@ async function loadUsers(){
 async function toggleCh(chId){
   const d=await api('/channel/toggle','POST',{channel_id:chId});
   if(d&&d.ok){toast(d.translation_on?'翻譯已開':'翻譯已關');loadChannels()}
+}
+
+async function leaveGuild(guildId,guildName){
+  if(!confirm('確定要退出伺服器「'+guildName+'」？\\n此操作無法復原！')){return}
+  const d=await api('/guild/leave','POST',{guild_id:guildId});
+  if(d&&d.ok){toast('已退出: '+d.name);loadChannels();loadUsers()}
+  else if(d&&d.error){toast(d.error)}
 }
 
 async function setChLang(chId,lang){
@@ -2217,6 +2230,7 @@ async def api_admin_channels(request):
                     "id": str(ch_id),
                     "name": ch.name,
                     "guild": guild.name,
+                    "guild_id": str(guild.id),
                     "translation_on": channel_settings.get(ch_id, True),
                     "target_lang": channel_target_lang.get(ch_id, "id"),
                     "skip_count": len(channel_skip_users.get(ch_id, set())),
@@ -2431,6 +2445,23 @@ async def api_admin_user_skip(request):
             return web.json_response({"ok": True, "skipped": True})
     return web.json_response({"ok": True})
 
+async def api_admin_guild_leave(request):
+    """Leave a Discord guild/server."""
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    data = await request.json()
+    guild_id = int(data.get("guild_id", 0))
+    if not guild_id:
+        return web.json_response({"error": "missing guild_id"}, status=400)
+    if bot.is_ready():
+        guild = bot.get_guild(guild_id)
+        if guild:
+            name = guild.name
+            await guild.leave()
+            logger.info(f"Left guild: {name} ({guild_id})")
+            return web.json_response({"ok": True, "name": name})
+    return web.json_response({"error": "guild not found"}, status=404)
+
 async def api_admin_channel_members(request):
     """Get all members for a channel with their skip status."""
     if not check_admin_key(request):
@@ -2491,6 +2522,7 @@ async def start_web_server():
     app.router.add_post("/api/admin/channel/lang", api_admin_channel_lang)
     app.router.add_post("/api/admin/user/skip", api_admin_user_skip)
     app.router.add_get("/api/admin/channel/members", api_admin_channel_members)
+    app.router.add_post("/api/admin/guild/leave", api_admin_guild_leave)
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
     await runner.setup()
