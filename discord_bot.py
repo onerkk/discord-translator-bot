@@ -39,6 +39,9 @@ channel_img_settings = {}   # {channel_id: True/False} image OCR on/off
 channel_audio_settings = {} # {channel_id: True/False} voice on/off
 channel_wo_settings = {}    # {channel_id: True/False} work order detection on/off
 
+# Bot-level admin list (users who can use admin commands without Discord admin perms)
+bot_admins = set()          # set(user_ids)
+
 # Translation cache
 translation_cache = {}
 CACHE_MAX_SIZE = 500
@@ -897,7 +900,9 @@ class HandoverView(discord.ui.View):
 
 # ─── Admin permission check ─────────────────────────────
 def is_admin(interaction: discord.Interaction) -> bool:
-    """Check if user has admin/manage_guild permission."""
+    """Check if user has admin/manage_guild permission or is a bot admin."""
+    if interaction.user.id in bot_admins:
+        return True
     if not interaction.guild:
         return True
     perms = interaction.user.guild_permissions
@@ -1766,6 +1771,10 @@ async def cmd_term(interaction: discord.Interaction, keyword: str):
 album_channels = {}    # {guild_id: channel_id}
 notebook_channels = {} # {guild_id: channel_id}
 
+# Per-guild enable/disable for album & notebook features
+guild_album_enabled = {}    # {guild_id: True/False}
+guild_notebook_enabled = {} # {guild_id: True/False}
+
 NOTEBOOK_TAGS = [
     {"name": "📢 公告 Pengumuman", "emoji": "📢"},
     {"name": "📋 SOP", "emoji": "📋"},
@@ -1785,6 +1794,7 @@ async def cmd_setup_album(interaction: discord.Interaction, name: str = "相簿-
         return
     await interaction.response.defer()
     guild = interaction.guild
+    guild_album_enabled[guild.id] = True  # Auto-enable on setup
 
     # Check if album channel already exists
     existing = discord.utils.get(guild.text_channels, name=name)
@@ -1860,6 +1870,7 @@ async def cmd_setup_notebook(interaction: discord.Interaction, name: str = "筆�
         return
     await interaction.response.defer()
     guild = interaction.guild
+    guild_notebook_enabled[guild.id] = True  # Auto-enable on setup
 
     # Check if forum channel already exists
     for ch in guild.forums:
@@ -1943,6 +1954,9 @@ async def cmd_setup_notebook(interaction: discord.Interaction, name: str = "筆�
 )
 async def cmd_album_new(interaction: discord.Interaction, name: str, description: str = ""):
     guild = interaction.guild
+    if not guild_album_enabled.get(guild.id, True):
+        await interaction.response.send_message("❌ 相簿功能已被管理員關閉 / Fitur album dinonaktifkan", ephemeral=True)
+        return
     album_ch_id = album_channels.get(guild.id)
 
     # If not setup yet, try to find by name
@@ -2069,6 +2083,9 @@ class NoteTagSelect(discord.ui.View):
 )
 async def cmd_note(interaction: discord.Interaction, title: str, content: str):
     guild = interaction.guild
+    if not guild_notebook_enabled.get(guild.id, True):
+        await interaction.response.send_message("❌ 筆記本功能已被管理員關閉 / Fitur catatan dinonaktifkan", ephemeral=True)
+        return
     nb_ch_id = notebook_channels.get(guild.id)
 
     # Try to find by name
@@ -2104,6 +2121,9 @@ async def cmd_note(interaction: discord.Interaction, title: str, content: str):
 @bot.tree.command(name="album_list", description="查看所有子相簿")
 async def cmd_album_list(interaction: discord.Interaction):
     guild = interaction.guild
+    if not guild_album_enabled.get(guild.id, True):
+        await interaction.response.send_message("❌ 相簿功能已被管理員關閉 / Fitur album dinonaktifkan", ephemeral=True)
+        return
     album_ch_id = album_channels.get(guild.id)
 
     if not album_ch_id:
@@ -2216,6 +2236,7 @@ select{width:100%;padding:10px;border-radius:8px;background:#1a1a1a;color:#fff;b
 <div class="tabs">
 <div class="tab active" onclick="switchTab('dash')">總覽</div>
 <div class="tab" onclick="switchTab('channels')">頻道</div>
+<div class="tab" onclick="switchTab('album')">相簿＆筆記</div>
 <div class="tab" onclick="switchTab('whitelist')">白名單</div>
 <div class="tab" onclick="switchTab('users')">使用者</div>
 <div class="tab" onclick="switchTab('storage')">儲區</div>
@@ -2229,6 +2250,11 @@ select{width:100%;padding:10px;border-radius:8px;background:#1a1a1a;color:#fff;b
 <!-- Channels -->
 <div class="panel" id="panel-channels">
 <div id="channelList"><div class="empty">載入中...</div></div>
+</div>
+
+<!-- Album & Notebook -->
+<div class="panel" id="panel-album">
+<div id="albumGuildList"><div class="empty">載入中...</div></div>
 </div>
 
 <!-- Whitelist (skip management) -->
@@ -2304,10 +2330,11 @@ function doLogin(){
 }
 
 function switchTab(name){
-  const labels={'dash':'總覽','channels':'頻道','whitelist':'白名單','users':'使用者','storage':'儲區'};
+  const labels={'dash':'總覽','channels':'頻道','album':'相簿','whitelist':'白名單','users':'使用者','storage':'儲區'};
   document.querySelectorAll('.tab').forEach(t=>{t.classList.toggle('active',t.textContent.includes(labels[name]))});
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.getElementById('panel-'+name).classList.add('active');
+  if(name==='album')loadAlbum();
 }
 
 function loadAll(){loadStats();loadChannels();loadUsers();loadStorage()}
@@ -2345,7 +2372,11 @@ async function loadChannels(){
           <option value="ko" ${c.target_lang==='ko'?'selected':''}>韓文</option>
         </select>
         ｜跳過: ${c.skip_count}人
-        ｜🖼️${c.img_on?'✅':'❌'} 🎤${c.voice_on?'✅':'❌'} 📋${c.wo_on?'✅':'❌'}
+        <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
+          <span class="badge ${c.img_on?'badge-on':'badge-off'}" style="cursor:pointer" onclick="toggleChFeature('${c.id}','img')">🖼️ 圖片${c.img_on?'開':'關'}</span>
+          <span class="badge ${c.voice_on?'badge-on':'badge-off'}" style="cursor:pointer" onclick="toggleChFeature('${c.id}','voice')">🎤 語音${c.voice_on?'開':'關'}</span>
+          <span class="badge ${c.wo_on?'badge-on':'badge-off'}" style="cursor:pointer" onclick="toggleChFeature('${c.id}','wo')">📋 工單${c.wo_on?'開':'關'}</span>
+        </div>
       </div>
     </div>
   `).join('');
@@ -2393,9 +2424,26 @@ async function loadUsers(){
   el.innerHTML=d.users.map(u=>`
     <div class="card">
       <div class="card-title"><span>${u.name}</span><span class="badge ${u.lang==='—'?'badge-off':'badge-on'}">${u.lang==='—'?'未設定':u.lang}</span></div>
-      <div class="card-sub">ID: ${u.id}</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px">
+        <span class="card-sub">ID: ${u.id}</span>
+        <div style="display:flex;align-items:center;gap:6px">
+          <span style="font-size:11px;color:${u.is_admin?'#5865F2':'#666'}">${u.is_admin?'🔑 管理員':'一般'}</span>
+          <label class="toggle">
+            <input type="checkbox" ${u.is_admin?'checked':''} onchange="toggleAdmin('${u.id}','${u.name}',this.checked)">
+            <span class="slider"></span>
+          </label>
+        </div>
+      </div>
     </div>
   `).join('');
+}
+
+async function toggleAdmin(uid,name,checked){
+  if(checked){
+    if(!confirm('確定授予「'+name+'」管理員權限？\\n將可使用所有 🔒 管理指令'))return loadUsers();
+  }
+  const d=await api('/user/admin','POST',{user_id:uid,enabled:checked});
+  if(d&&d.ok){toast(name+(d.is_admin?' 已授予管理員':' 已移除管理員'));loadUsers()}
 }
 
 async function toggleCh(chId){
@@ -2413,6 +2461,49 @@ async function leaveGuild(guildId,guildName){
 async function setChLang(chId,lang){
   const d=await api('/channel/lang','POST',{channel_id:chId,lang:lang});
   if(d&&d.ok){toast('語言已切換: '+lang)}
+}
+
+async function toggleChFeature(chId,feature){
+  const d=await api('/channel/feature','POST',{channel_id:chId,feature:feature});
+  if(d&&d.ok){toast(d.label+(d.enabled?' 已開啟':' 已關閉'));loadChannels()}
+}
+
+async function loadAlbum(){
+  const d=await api('/album/guilds');
+  if(!d)return;
+  const el=document.getElementById('albumGuildList');
+  const guilds=d.guilds||[];
+  if(!guilds.length){el.innerHTML='<div class="empty">尚無伺服器</div>';return}
+  el.innerHTML=guilds.map(g=>`
+    <div class="card">
+      <div class="card-title">
+        <span>🏠 ${g.name}</span>
+      </div>
+      <div style="margin-top:10px">
+        <div class="wl-row">
+          <span class="wl-name">📷 相簿功能</span>
+          <label class="toggle">
+            <input type="checkbox" ${g.album_enabled?'checked':''} onchange="toggleGuildFeature('${g.id}','album',this.checked)">
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div style="font-size:11px;color:#888;padding:2px 0 8px">${g.album_channel?'頻道: #'+g.album_channel:'尚未建立（用 /setup_album）'}</div>
+        <div class="wl-row">
+          <span class="wl-name">📝 筆記本功能</span>
+          <label class="toggle">
+            <input type="checkbox" ${g.notebook_enabled?'checked':''} onchange="toggleGuildFeature('${g.id}','notebook',this.checked)">
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div style="font-size:11px;color:#888;padding:2px 0 4px">${g.notebook_channel?'頻道: #'+g.notebook_channel:'尚未建立（用 /setup_notebook）'}</div>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function toggleGuildFeature(guildId,feature,checked){
+  const d=await api('/album/toggle','POST',{guild_id:guildId,feature:feature,enabled:checked});
+  if(d&&d.ok){toast(d.label+(d.enabled?' 已開啟':' 已關閉'));loadAlbum()}
 }
 
 async function loadStorage(){
@@ -2647,7 +2738,7 @@ async def api_admin_users(request):
                 if member:
                     name = member.display_name
                     break
-        users.append({"id": str(uid), "name": name, "lang": lang})
+        users.append({"id": str(uid), "name": name, "lang": lang, "is_admin": uid in bot_admins})
         seen.add(uid)
     # Also show guild members without prefs yet
     if bot.is_ready():
@@ -2655,9 +2746,10 @@ async def api_admin_users(request):
             for member in guild.members:
                 if member.bot or member.id in seen:
                     continue
-                users.append({"id": str(member.id), "name": member.display_name, "lang": "—"})
+                users.append({"id": str(member.id), "name": member.display_name, "lang": "—", "is_admin": member.id in bot_admins})
                 seen.add(member.id)
-    users.sort(key=lambda x: x["name"])
+    # Sort: admins first, then alphabetical
+    users.sort(key=lambda x: (not x["is_admin"], x["name"]))
     return web.json_response({"users": users})
 
 async def api_admin_storage(request):
@@ -2838,6 +2930,21 @@ async def api_admin_user_skip(request):
             return web.json_response({"ok": True, "skipped": True})
     return web.json_response({"ok": True})
 
+async def api_admin_user_admin(request):
+    """Grant or revoke bot admin permission for a user."""
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    data = await request.json()
+    uid = int(data.get("user_id", 0))
+    enabled = data.get("enabled", False)
+    if not uid:
+        return web.json_response({"error": "missing user_id"}, status=400)
+    if enabled:
+        bot_admins.add(uid)
+    else:
+        bot_admins.discard(uid)
+    return web.json_response({"ok": True, "is_admin": uid in bot_admins})
+
 async def api_admin_guild_leave(request):
     """Leave a Discord guild/server."""
     if not check_admin_key(request):
@@ -2878,6 +2985,74 @@ async def api_admin_channel_members(request):
             members.sort(key=lambda x: x["name"])
     return web.json_response({"members": members})
 
+
+async def api_admin_channel_feature(request):
+    """Toggle img/voice/wo per channel."""
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    data = await request.json()
+    ch_id = int(data.get("channel_id", 0))
+    feature = data.get("feature", "")
+    if not ch_id or feature not in ("img", "voice", "wo"):
+        return web.json_response({"error": "invalid params"}, status=400)
+
+    labels = {"img": "🖼️ 圖片翻譯", "voice": "🎤 語音翻譯", "wo": "📋 工單偵測"}
+    settings_map = {"img": channel_img_settings, "voice": channel_audio_settings, "wo": channel_wo_settings}
+
+    store = settings_map[feature]
+    current = store.get(ch_id, True)
+    store[ch_id] = not current
+    return web.json_response({"ok": True, "enabled": not current, "label": labels[feature]})
+
+
+async def api_admin_album_guilds(request):
+    """List guilds with album/notebook status."""
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    guilds = []
+    if bot.is_ready():
+        for guild in bot.guilds:
+            gid = guild.id
+            album_ch = None
+            nb_ch = None
+            if gid in album_channels:
+                ch = bot.get_channel(album_channels[gid])
+                if ch:
+                    album_ch = ch.name
+            if gid in notebook_channels:
+                ch = bot.get_channel(notebook_channels[gid])
+                if ch:
+                    nb_ch = ch.name
+            guilds.append({
+                "id": str(gid),
+                "name": guild.name,
+                "album_enabled": guild_album_enabled.get(gid, True),
+                "notebook_enabled": guild_notebook_enabled.get(gid, True),
+                "album_channel": album_ch,
+                "notebook_channel": nb_ch,
+            })
+    return web.json_response({"guilds": guilds})
+
+
+async def api_admin_album_toggle(request):
+    """Toggle album or notebook per guild."""
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    data = await request.json()
+    guild_id = int(data.get("guild_id", 0))
+    feature = data.get("feature", "")
+    enabled = data.get("enabled", True)
+    if not guild_id or feature not in ("album", "notebook"):
+        return web.json_response({"error": "invalid params"}, status=400)
+
+    labels = {"album": "📷 相簿", "notebook": "📝 筆記本"}
+    if feature == "album":
+        guild_album_enabled[guild_id] = enabled
+    else:
+        guild_notebook_enabled[guild_id] = enabled
+    return web.json_response({"ok": True, "enabled": enabled, "label": labels[feature]})
+
+
 async def manifest_handler(request):
     return web.Response(text=DC_MANIFEST, content_type="application/manifest+json")
 
@@ -2914,8 +3089,12 @@ async def start_web_server():
     app.router.add_post("/api/admin/channel/toggle", api_admin_channel_toggle)
     app.router.add_post("/api/admin/channel/lang", api_admin_channel_lang)
     app.router.add_post("/api/admin/user/skip", api_admin_user_skip)
+    app.router.add_post("/api/admin/user/admin", api_admin_user_admin)
     app.router.add_get("/api/admin/channel/members", api_admin_channel_members)
+    app.router.add_post("/api/admin/channel/feature", api_admin_channel_feature)
     app.router.add_post("/api/admin/guild/leave", api_admin_guild_leave)
+    app.router.add_get("/api/admin/album/guilds", api_admin_album_guilds)
+    app.router.add_post("/api/admin/album/toggle", api_admin_album_toggle)
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
     await runner.setup()
