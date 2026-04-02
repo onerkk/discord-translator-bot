@@ -2292,6 +2292,12 @@ async def sw_handler(request):
     return web.Response(text=DC_SW_JS, content_type="application/javascript")
 
 async def icon_handler(request):
+    # Serve uploaded icon.png from repo, fallback to generated
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
+    if os.path.exists(icon_path):
+        with open(icon_path, "rb") as f:
+            return web.Response(body=f.read(), content_type="image/png",
+                                headers={"Cache-Control": "public, max-age=86400"})
     size = 512 if "512" in request.path else 192
     return web.Response(body=get_icon(size), content_type="image/png",
                         headers={"Cache-Control": "public, max-age=86400"})
