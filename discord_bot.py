@@ -1951,28 +1951,70 @@ self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.add
 self.addEventListener('fetch',e=>{e.respondWith(fetch(e.request).catch(()=>caches.match(e.request)))});'''
 
 def generate_icon_png(size=192):
-    """Generate a proper sized purple PNG icon for PWA."""
+    """Generate a nice bot icon PNG."""
     import struct, zlib
     width = height = size
-    # Build raw pixel data: purple (#5865F2) square with rounded-look border
     raw = b''
     center = size / 2
-    radius = size * 0.42
+    r = size * 0.44  # main radius
+    br = size * 0.08  # border radius for rounding
+
     for y in range(height):
         raw += b'\x00'  # PNG filter: none
         for x in range(width):
-            # Distance from center for rounded corners
-            dx = abs(x - center)
-            dy = abs(y - center)
-            corner_dist = max(dx, dy)
-            if corner_dist < radius:
-                raw += b'\x58\x65\xF2'  # Purple #5865F2
-            elif corner_dist < radius + 3:
-                raw += b'\x48\x55\xE2'  # Slightly darker edge
+            # Normalized coordinates
+            nx = (x - center) / (size / 2)
+            ny = (y - center) / (size / 2)
+
+            # Rounded square mask
+            ax = abs(nx) * 1.1
+            ay = abs(ny) * 1.1
+            in_shape = max(ax, ay) < 0.88 and (ax + ay) < 1.5
+
+            if not in_shape:
+                raw += b'\x0a\x0a\x0a'  # transparent/dark bg
+                continue
+
+            # Gradient: top purple #5865F2 → bottom blue #3B44C4
+            t = (ny + 1) / 2  # 0 to 1 top to bottom
+            pr = int(0x58 * (1 - t) + 0x3B * t)
+            pg = int(0x65 * (1 - t) + 0x44 * t)
+            pb = int(0xF2 * (1 - t) + 0xC4 * t)
+
+            # Draw chat bubble shape (white)
+            bx = nx * 1.3
+            by = (ny - 0.05) * 1.5
+            in_bubble = (bx * bx + by * by) < 0.35
+            # Small triangle at bottom
+            in_tri = (abs(bx) < 0.12 and by > 0.28 and by < 0.52)
+
+            # Draw "中" text area (simplified)
+            tx = nx + 0.22
+            ty = ny - 0.02
+            in_left_char = abs(tx) < 0.18 and abs(ty) < 0.2
+
+            # Draw "ID" text area
+            rx = nx - 0.22
+            ry = ny - 0.02
+            in_right_char = abs(rx) < 0.16 and abs(ry) < 0.18
+
+            # Divider line
+            in_divider = abs(nx) < 0.015 and abs(ny - 0.0) < 0.22
+
+            if in_bubble or in_tri:
+                if in_divider:
+                    raw += bytes([pr, pg, pb])  # divider in gradient color
+                elif in_left_char:
+                    # Left side slightly tinted
+                    raw += b'\xF0\xF0\xFF'
+                elif in_right_char:
+                    raw += b'\xFF\xF0\xF0'
+                else:
+                    raw += b'\xFF\xFF\xFF'  # white bubble
             else:
-                raw += b'\x0a\x0a\x0a'  # Dark background #0a0a0a
+                raw += bytes([pr, pg, pb])  # gradient background
+
     compressed = zlib.compress(raw, 9)
-    # Build PNG
     def make_chunk(chunk_type, data):
         chunk = chunk_type + data
         return struct.pack('>I', len(data)) + chunk + struct.pack('>I', zlib.crc32(chunk) & 0xffffffff)
