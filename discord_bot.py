@@ -11,6 +11,7 @@ import urllib.parse
 import time
 import asyncio
 import io
+import base64
 
 import discord
 from discord import app_commands
@@ -24,6 +25,7 @@ logger = logging.getLogger("discord_bot")
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "changeme")
 
 oai = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
@@ -547,12 +549,452 @@ def query_storage(customer_name):
     return customer_name, entries
 
 
+# ─── OCR (image text extraction) ────────────────────────
+def ocr_and_translate_image(image_base64, tgt_lang):
+    """OCR + translate image text in one API call."""
+    if not oai:
+        return None
+    tgt_name = LANG_NAMES.get(tgt_lang, tgt_lang)
+    tgt_flag = LANG_FLAGS.get(tgt_lang, "")
+    try:
+        r = oai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an OCR + translation assistant for a factory work group chat.\n"
+                        "Task: Extract ALL text from the image, then translate each section.\n\n"
+                        "OUTPUT FORMAT:\n"
+                        "For each distinct section/paragraph in the image, output:\n"
+                        "original text...\n"
+                        + tgt_flag + " translated text...\n"
+                        "(blank line before next section)\n\n"
+                        "RULES:\n"
+                        "1. Keep the SAME structure, numbering, and line breaks as the original.\n"
+                        "2. Each section: original text first, then translation with " + tgt_flag + " flag.\n"
+                        "3. Translate naturally, casual daily language for factory workers.\n"
+                        "4. Target Traditional Chinese = Taiwan style.\n"
+                        "5. NEVER translate or romanize person names. Keep Chinese names in original characters.\n"
+                        "6. NEVER translate customer/company names. Keep them EXACTLY as-is.\n"
+                        "7. If there is no text in the image, output exactly: NO_TEXT_FOUND"
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_base64, "detail": "high"}},
+                        {"type": "text", "text": "Extract all text from this image and translate to " + tgt_name + "."}
+                    ]
+                }
+            ],
+            temperature=0.1,
+            max_tokens=2000,
+        )
+        result = r.choices[0].message.content.strip()
+        if result == "NO_TEXT_FOUND" or not result:
+            return None
+        return result
+    except Exception as e:
+        logger.error("OCR error: %s", e)
+        return None
+
+
+def ocr_image_only(image_base64):
+    """Extract text only from image (for work order detection)."""
+    if not oai:
+        return None
+    try:
+        r = oai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are an OCR assistant. Extract ALL text visible in the image. Output ONLY the extracted text, preserving line breaks. If no text, output: NO_TEXT_FOUND"},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_base64, "detail": "high"}},
+                    {"type": "text", "text": "Extract all text from this image."}
+                ]}
+            ],
+            temperature=0.1, max_tokens=2000,
+        )
+        result = r.choices[0].message.content.strip()
+        if result == "NO_TEXT_FOUND" or not result:
+            return None
+        return result
+    except Exception as e:
+        logger.error("OCR-only error: %s", e)
+        return None
+
+
+# ─── Work order detection ───────────────────────────────
+def detect_work_order(ocr_text):
+    """Detect if OCR text is from a factory work order (製造指示書)."""
+    if not ocr_text:
+        return None
+    wo_keywords = ["冷精棒製造指示書", "製造指示書", "訂單編號", "客戶名稱", "成品尺寸",
+                   "FINAL流程", "FINAL", "MIC_NO", "ID_NO", "HRITABPDIL", "退火代碼",
+                   "冷精棒", "收貨人", "短尺", "品保", "特殊", "削皮", "訂單資訊",
+                   "成品尺寸MIN", "成品尺寸MAX", "製造指示"]
+    keyword_count = sum(1 for kw in wo_keywords if kw in ocr_text)
+    if keyword_count < 2:
+        return None
+    patterns = [r'客戶名稱[:\s：]*([^\s\n|,，]+)', r'客戶[:\s：]*([^\s\n|,，]+)',
+                r'客[户戶]名[称稱][:\s：]*([^\s\n|,，]+)']
+    for pat in patterns:
+        m = re.search(pat, ocr_text)
+        if m:
+            customer = m.group(1).strip()
+            if customer and len(customer) >= 2:
+                return customer
+    for name in CUSTOMER_NAMES:
+        if len(name) >= 2 and name in ocr_text:
+            return name
+    return None
+
+
+def format_storage_for_work_order(customer_name):
+    """Format storage lookup for work order image detection."""
+    entries = STORAGE_LOOKUP.get(customer_name)
+    if not entries:
+        for key in STORAGE_LOOKUP:
+            if key.lower() == customer_name.lower() or customer_name in key or key in customer_name:
+                entries = STORAGE_LOOKUP[key]
+                customer_name = key
+                break
+    if not entries:
+        return None
+    lines = [f"📋 工單偵測\n客戶：{customer_name}\n", "📦 儲區查詢", "=" * 18]
+    for length, area in entries:
+        zh = format_length_zh(length)
+        lines.append(f"{zh} → {area}")
+    lines.append("=" * 18)
+    return "\n".join(lines)
+
+
+# ─── Voice transcription (Whisper) ──────────────────────
+def transcribe_audio(audio_bytes, filename="audio.ogg"):
+    """Transcribe audio using OpenAI Whisper."""
+    if not oai:
+        return None
+    try:
+        audio_file = io.BytesIO(audio_bytes)
+        audio_file.name = filename
+        r = oai.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+        )
+        text = r.text.strip()
+        return text if text else None
+    except Exception as e:
+        logger.error("Whisper error: %s", e)
+        return None
+
+
+# ─── Usage stats tracking ───────────────────────────────
+usage_stats = {
+    "text_translations": 0,
+    "image_translations": 0,
+    "voice_translations": 0,
+    "work_orders_detected": 0,
+    "slash_commands": 0,
+    "reaction_translations": 0,
+    "context_translations": 0,
+    "start_time": time.time(),
+}
+
+# ─── Per-user language preference ───────────────────────
+user_lang_prefs = {}  # {user_id: "zh"/"id"/"en"/...}
+
+# ─── Auto-role language mapping ─────────────────────────
+LANG_ROLE_NAMES = {
+    "zh": "🇹🇼 中文",
+    "id": "🇮🇩 Indonesia",
+    "en": "🇬🇧 English",
+    "vi": "🇻🇳 Tiếng Việt",
+    "th": "🇹🇭 ไทย",
+    "ja": "🇯🇵 日本語",
+    "ko": "🇰🇷 한국어",
+}
+
+# ─── Flag emoji to language mapping ─────────────────────
+FLAG_TO_LANG = {
+    "🇹🇼": "zh", "🇨🇳": "zh", "🇮🇩": "id", "🇬🇧": "en", "🇺🇸": "en",
+    "🇻🇳": "vi", "🇹🇭": "th", "🇯🇵": "ja", "🇰🇷": "ko", "🇲🇾": "ms", "🇵🇭": "tl",
+}
+
 # ─── Discord Bot ────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+# ─── Translate Button View ──────────────────────────────
+class TranslateView(discord.ui.View):
+    """Buttons under translation results."""
+    def __init__(self, original_text, src_lang, current_tgt):
+        super().__init__(timeout=300)
+        self.original_text = original_text
+        self.src_lang = src_lang
+        self.current_tgt = current_tgt
+
+    @discord.ui.button(label="🇮🇩 ID", style=discord.ButtonStyle.secondary)
+    async def btn_id(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._retranslate(interaction, "id")
+
+    @discord.ui.button(label="🇹🇼 中文", style=discord.ButtonStyle.secondary)
+    async def btn_zh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._retranslate(interaction, "zh")
+
+    @discord.ui.button(label="🇬🇧 EN", style=discord.ButtonStyle.secondary)
+    async def btn_en(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._retranslate(interaction, "en")
+
+    @discord.ui.button(label="🇻🇳 VI", style=discord.ButtonStyle.secondary)
+    async def btn_vi(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._retranslate(interaction, "vi")
+
+    async def _retranslate(self, interaction, tgt):
+        if tgt == self.src_lang:
+            await interaction.response.send_message("⚠️ 來源語言和目標語言相同", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        result = translate(self.original_text, self.src_lang, tgt)
+        if result:
+            flag = LANG_FLAGS.get(tgt, "🌐")
+            usage_stats["text_translations"] += 1
+            await interaction.followup.send(f"{flag} {result}", ephemeral=True)
+        else:
+            await interaction.followup.send("❌ 翻譯失敗", ephemeral=True)
+
+
+# ─── Handover Template View ─────────────────────────────
+class HandoverView(discord.ui.View):
+    """Buttons for shift handover template."""
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="A班 → B班", style=discord.ButtonStyle.primary)
+    async def shift_ab(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._send_template(interaction, "A", "B")
+
+    @discord.ui.button(label="B班 → C班", style=discord.ButtonStyle.primary)
+    async def shift_bc(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._send_template(interaction, "B", "C")
+
+    @discord.ui.button(label="C班 → D班", style=discord.ButtonStyle.primary)
+    async def shift_cd(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._send_template(interaction, "C", "D")
+
+    @discord.ui.button(label="D班 → A班", style=discord.ButtonStyle.primary)
+    async def shift_da(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._send_template(interaction, "D", "A")
+
+    async def _send_template(self, interaction, from_shift, to_shift):
+        zh = (f"📋 **{from_shift}班 → {to_shift}班 交班紀錄**\n"
+              f"━━━━━━━━━━━━━━━━━━\n"
+              f"📅 日期：\n"
+              f"👤 交班人：\n"
+              f"👤 接班人：\n"
+              f"━━━━━━━━━━━━━━━━━━\n"
+              f"🔧 **設備狀態：**\n"
+              f"• \n"
+              f"📦 **生產進度：**\n"
+              f"• \n"
+              f"⚠️ **待處理事項：**\n"
+              f"• \n"
+              f"📝 **備註：**\n"
+              f"• \n"
+              f"━━━━━━━━━━━━━━━━━━")
+        id_text = (f"📋 **Serah terima shift {from_shift} → {to_shift}**\n"
+                   f"━━━━━━━━━━━━━━━━━━\n"
+                   f"📅 Tanggal:\n"
+                   f"👤 Shift keluar:\n"
+                   f"👤 Shift masuk:\n"
+                   f"━━━━━━━━━━━━━━━━━━\n"
+                   f"🔧 **Status mesin:**\n"
+                   f"• \n"
+                   f"📦 **Progress produksi:**\n"
+                   f"• \n"
+                   f"⚠️ **Yang harus ditangani:**\n"
+                   f"• \n"
+                   f"📝 **Catatan:**\n"
+                   f"• \n"
+                   f"━━━━━━━━━━━━━━━━━━")
+        embed = discord.Embed(title=f"📋 交班 Serah Terima | {from_shift}→{to_shift}", color=0x06C755)
+        embed.add_field(name="🇹🇼 中文", value=zh, inline=False)
+        embed.add_field(name="🇮🇩 Indonesia", value=id_text, inline=False)
+        await interaction.response.send_message(embed=embed)
+
+
+# ─── Admin permission check ─────────────────────────────
+def is_admin(interaction: discord.Interaction) -> bool:
+    """Check if user has admin/manage_guild permission."""
+    if not interaction.guild:
+        return True
+    perms = interaction.user.guild_permissions
+    return perms.administrator or perms.manage_guild
+
+
+# ─── Report Modal (popup form) ──────────────────────────
+class ReportModal(discord.ui.Modal, title="🚨 異常回報 / Laporan Masalah"):
+    location = discord.ui.TextInput(
+        label="位置/機台 (Lokasi/Mesin)",
+        placeholder="例：I5研磨機 / Station 420",
+        max_length=100,
+    )
+    description = discord.ui.TextInput(
+        label="異常描述 (Deskripsi masalah)",
+        style=discord.TextStyle.paragraph,
+        placeholder="詳細描述異常狀況...",
+        max_length=1000,
+    )
+    action_taken = discord.ui.TextInput(
+        label="已採取措施 (Tindakan)",
+        style=discord.TextStyle.paragraph,
+        placeholder="目前已做了什麼處理...",
+        max_length=500,
+        required=False,
+    )
+    urgency = discord.ui.TextInput(
+        label="緊急程度 (1=輕微 2=一般 3=緊急)",
+        placeholder="1, 2, 或 3",
+        max_length=1,
+        default="2",
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        level_map = {"1": ("🟢", "輕微", "Ringan", 0x00AA00),
+                     "2": ("🟡", "一般", "Normal", 0xFFAA00),
+                     "3": ("🔴", "緊急", "Darurat", 0xFF0000)}
+        lvl = level_map.get(str(self.urgency).strip(), level_map["2"])
+
+        # Translate description
+        src = detect_language(str(self.description)) or "zh"
+        tgt = "id" if src == "zh" else "zh"
+        translated_desc = translate(str(self.description), src, tgt)
+        translated_action = ""
+        if str(self.action_taken).strip():
+            translated_action = translate(str(self.action_taken), src, tgt) or ""
+
+        embed = discord.Embed(
+            title=f"🚨 異常回報 / Laporan Masalah {lvl[0]}",
+            color=lvl[3]
+        )
+        embed.add_field(name=f"{lvl[0]} 等級 / Level", value=f"{lvl[1]} / {lvl[2]}", inline=True)
+        embed.add_field(name="📍 位置 / Lokasi", value=str(self.location), inline=True)
+        embed.add_field(name=f"{LANG_FLAGS.get(src, '')} 描述", value=str(self.description), inline=False)
+        if translated_desc:
+            embed.add_field(name=f"{LANG_FLAGS.get(tgt, '')} 翻譯", value=translated_desc, inline=False)
+        if str(self.action_taken).strip():
+            embed.add_field(name=f"{LANG_FLAGS.get(src, '')} 已處理", value=str(self.action_taken), inline=False)
+            if translated_action:
+                embed.add_field(name=f"{LANG_FLAGS.get(tgt, '')} Tindakan", value=translated_action, inline=False)
+        embed.set_footer(text=f"回報人：{interaction.user.display_name} | {time.strftime('%Y-%m-%d %H:%M')}")
+        usage_stats["slash_commands"] += 1
+        await interaction.followup.send(embed=embed)
+
+
+# ─── Language Dropdown Select ───────────────────────────
+class LangSelectView(discord.ui.View):
+    """Dropdown to select personal language preference."""
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.select(
+        placeholder="選擇你的語言 / Pilih bahasa...",
+        options=[
+            discord.SelectOption(label="🇹🇼 中文 (繁體)", value="zh", description="Traditional Chinese"),
+            discord.SelectOption(label="🇮🇩 Bahasa Indonesia", value="id", description="Indonesian"),
+            discord.SelectOption(label="🇬🇧 English", value="en", description="English"),
+            discord.SelectOption(label="🇻🇳 Tiếng Việt", value="vi", description="Vietnamese"),
+            discord.SelectOption(label="🇹🇭 ภาษาไทย", value="th", description="Thai"),
+            discord.SelectOption(label="🇯🇵 日本語", value="ja", description="Japanese"),
+            discord.SelectOption(label="🇰🇷 한국어", value="ko", description="Korean"),
+            discord.SelectOption(label="🇲🇾 Bahasa Melayu", value="ms", description="Malay"),
+            discord.SelectOption(label="🇵🇭 Filipino", value="tl", description="Filipino/Tagalog"),
+        ]
+    )
+    async def lang_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        lang = select.values[0]
+        user_lang_prefs[interaction.user.id] = lang
+        flag = LANG_FLAGS.get(lang, "")
+        name = LANG_NAMES_ZH.get(lang, LANG_NAMES.get(lang, lang))
+
+        # Auto-assign language role
+        await auto_assign_role(interaction.user, interaction.guild, lang)
+
+        await interaction.response.send_message(
+            f"✅ 你的語言已設為 {flag} **{name}**\n"
+            f"Bot 會根據你的語言偏好翻譯",
+            ephemeral=True
+        )
+
+
+# ─── Poll View (bilingual voting) ──────────────────────
+class PollView(discord.ui.View):
+    """Interactive bilingual poll buttons."""
+    def __init__(self, options_zh, options_tgt, tgt_flag):
+        super().__init__(timeout=None)
+        self.votes = {}  # {option_index: set(user_ids)}
+        self.options_zh = options_zh
+        self.options_tgt = options_tgt
+        for i, (zh, tgt) in enumerate(zip(options_zh, options_tgt)):
+            self.votes[i] = set()
+            button = discord.ui.Button(
+                label=f"{zh} / {tgt}" if len(zh) + len(tgt) < 70 else zh,
+                style=discord.ButtonStyle.primary,
+                custom_id=f"poll_{i}",
+            )
+            button.callback = self._make_callback(i)
+            self.add_item(button)
+
+    def _make_callback(self, index):
+        async def callback(interaction: discord.Interaction):
+            uid = interaction.user.id
+            # Remove from other options
+            for idx in self.votes:
+                self.votes[idx].discard(uid)
+            # Add to selected
+            self.votes[index].add(uid)
+            # Build results
+            lines = []
+            for i, (zh, tgt) in enumerate(zip(self.options_zh, self.options_tgt)):
+                count = len(self.votes[i])
+                bar = "█" * count + "░" * max(0, 10 - count)
+                lines.append(f"{zh} / {tgt}: {bar} **{count}**")
+            await interaction.response.send_message(
+                f"✅ 已投票：**{self.options_zh[index]}**\n\n" + "\n".join(lines),
+                ephemeral=True
+            )
+        return callback
+
+
+# ─── Auto-role assignment helper ────────────────────────
+async def auto_assign_role(member, guild, lang):
+    """Auto-assign a language role to a member."""
+    if not guild or not member:
+        return
+    role_name = LANG_ROLE_NAMES.get(lang)
+    if not role_name:
+        return
+    try:
+        # Find or create role
+        role = discord.utils.get(guild.roles, name=role_name)
+        if not role:
+            role = await guild.create_role(name=role_name, mentionable=True)
+        # Remove other language roles
+        for rn in LANG_ROLE_NAMES.values():
+            existing = discord.utils.get(guild.roles, name=rn)
+            if existing and existing in member.roles and existing != role:
+                await member.remove_roles(existing)
+        # Add new role
+        if role not in member.roles:
+            await member.add_roles(role)
+    except Exception as e:
+        logger.error(f"Auto-role error: {e}")
 
 
 @bot.event
@@ -568,26 +1010,201 @@ async def on_ready():
     ))
 
 
+# ─── Flag emoji reaction translation ────────────────────
+@bot.event
+async def on_raw_reaction_add(payload):
+    """React with a flag emoji to translate a message to that language."""
+    if payload.member and payload.member.bot:
+        return
+    emoji = str(payload.emoji)
+    tgt = FLAG_TO_LANG.get(emoji)
+    if not tgt:
+        return
+    try:
+        channel = bot.get_channel(payload.channel_id)
+        if not channel:
+            return
+        message = await channel.fetch_message(payload.message_id)
+        if not message or message.author.bot:
+            return
+        text = message.content.strip()
+        if not text:
+            return
+        src = detect_language(text)
+        if not src or src == tgt:
+            return
+        result = translate(text, src, tgt)
+        if not result:
+            return
+        flag = LANG_FLAGS.get(tgt, "🌐")
+        embed = discord.Embed(description=f"{flag} {result}", color=0x06C755)
+        embed.set_footer(text=f"反應翻譯 {emoji} | {LANG_NAMES.get(src, src)[:2]} → {LANG_NAMES.get(tgt, tgt)[:2]}")
+        await message.reply(embed=embed, mention_author=False)
+        usage_stats["reaction_translations"] += 1
+    except Exception as e:
+        logger.error(f"Reaction translate error: {e}")
+
+
+# ─── Right-click context menu translation ────────────────
+@bot.tree.context_menu(name="翻譯這段")
+async def ctx_translate(interaction: discord.Interaction, message: discord.Message):
+    """Right-click a message → Apps → 翻譯這段"""
+    text = message.content.strip()
+    if not text:
+        await interaction.response.send_message("❌ 這則訊息沒有文字", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    src = detect_language(text)
+    if not src:
+        src = "id"
+    ch_id = interaction.channel_id
+    tgt_lang = channel_target_lang.get(ch_id, "id")
+    tgt = tgt_lang if src == "zh" else "zh"
+    if src == tgt:
+        tgt = "id" if src == "zh" else "zh"
+    result = translate(text, src, tgt)
+    if not result:
+        await interaction.followup.send("❌ 翻譯失敗", ephemeral=True)
+        return
+    flag = LANG_FLAGS.get(tgt, "🌐")
+    usage_stats["context_translations"] += 1
+    await interaction.followup.send(
+        f"**原文：** {text}\n{flag} **翻譯：** {result}",
+        ephemeral=True
+    )
+
+
+# ─── Welcome new members (bilingual) ────────────────────
+@bot.event
+async def on_member_join(member):
+    """Send bilingual welcome message when a new member joins."""
+    guild = member.guild
+    # Try to find a general/welcome channel
+    target_channel = None
+    for ch in guild.text_channels:
+        if ch.permissions_for(guild.me).send_messages:
+            if any(kw in ch.name.lower() for kw in ['一般', 'general', 'welcome', '歡迎']):
+                target_channel = ch
+                break
+    if not target_channel:
+        for ch in guild.text_channels:
+            if ch.permissions_for(guild.me).send_messages:
+                target_channel = ch
+                break
+    if not target_channel:
+        return
+    embed = discord.Embed(
+        title=f"👋 歡迎 / Selamat Datang!",
+        description=(
+            f"歡迎 **{member.display_name}** 加入 **{guild.name}**！\n"
+            f"Selamat datang **{member.display_name}** di **{guild.name}**!\n\n"
+            f"💬 直接打字會自動翻譯 / Ketik langsung otomatis diterjemahkan\n"
+            f"📦 輸入 `/help` 查看所有指令 / Ketik `/help` untuk lihat semua perintah"
+        ),
+        color=0x06C755
+    )
+    embed.set_thumbnail(url=member.display_avatar.url if member.display_avatar else None)
+    await target_channel.send(embed=embed)
+
+
 # ─── Auto-translate on message ──────────────────────────
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
-    # Process commands first
     await bot.process_commands(message)
 
+    # ── DM translation (private message to bot) ──
+    if isinstance(message.channel, discord.DMChannel):
+        text = message.content.strip()
+        if not text:
+            return
+        src = detect_language(text)
+        if not src:
+            await message.reply("❌ 無法偵測語言 / Bahasa tidak terdeteksi")
+            return
+        tgt = "id" if src == "zh" else "zh"
+        result = translate(text, src, tgt)
+        if result:
+            flag = LANG_FLAGS.get(tgt, "🌐")
+            embed = discord.Embed(description=f"{flag} {result}", color=0x06C755)
+            embed.set_footer(text=f"私訊翻譯 | {LANG_NAMES.get(src, src)[:2]} → {LANG_NAMES.get(tgt, tgt)[:2]}")
+            view = TranslateView(text, src, tgt)
+            await message.reply(embed=embed, view=view)
+            usage_stats["text_translations"] += 1
+        return
+
     ch_id = message.channel.id
-    # Check if translation is enabled (default: True)
     if not channel_settings.get(ch_id, True):
         return
-    # Check skip list
     if message.author.id in channel_skip_users.get(ch_id, set()):
         return
 
+    tgt_lang = channel_target_lang.get(ch_id, "id")
+
+    # ── Handle image attachments ──
+    for attachment in message.attachments:
+        if any(attachment.filename.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']):
+            try:
+                img_bytes = await attachment.read()
+                img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+
+                # Check for work order first
+                ocr_text = ocr_image_only(img_b64)
+                if ocr_text:
+                    customer = detect_work_order(ocr_text)
+                    if customer:
+                        storage_info = format_storage_for_work_order(customer)
+                        if storage_info:
+                            embed = discord.Embed(description=storage_info, color=0xFFD700)
+                            embed.set_footer(text="📋 工單自動偵測")
+                            await message.reply(embed=embed, mention_author=False)
+                            usage_stats["work_orders_detected"] += 1
+                            continue
+
+                # OCR + translate
+                result = ocr_and_translate_image(img_b64, tgt_lang)
+                if result:
+                    if len(result) > 4000:
+                        result = result[:4000] + "..."
+                    embed = discord.Embed(title="🖼️ 圖片翻譯", description=result, color=0x06C755)
+                    embed.set_footer(text="OCR + 翻譯")
+                    await message.reply(embed=embed, mention_author=False)
+                    usage_stats["image_translations"] += 1
+            except Exception as e:
+                logger.error(f"Image processing error: {e}")
+            continue
+
+        # ── Handle audio/voice attachments ──
+        if any(attachment.filename.lower().endswith(ext) for ext in ['.ogg', '.mp3', '.wav', '.m4a', '.opus', '.flac']):
+            try:
+                audio_bytes = await attachment.read()
+                text = transcribe_audio(audio_bytes, attachment.filename)
+                if not text:
+                    continue
+
+                src = detect_language(text) or "zh"
+                tgt = tgt_lang if src == "zh" else "zh"
+
+                result = translate(text, src, tgt) if src != tgt else None
+                src_flag = LANG_FLAGS.get(src, "🎤")
+                tgt_flag = LANG_FLAGS.get(tgt, "🌐")
+
+                embed = discord.Embed(color=0x06C755)
+                embed.add_field(name=f"🎤 語音辨識 {src_flag}", value=text, inline=False)
+                if result:
+                    embed.add_field(name=f"💬 翻譯 {tgt_flag}", value=result, inline=False)
+                embed.set_footer(text="Whisper 語音辨識 + 翻譯")
+                await message.reply(embed=embed, mention_author=False)
+                usage_stats["voice_translations"] += 1
+            except Exception as e:
+                logger.error(f"Audio processing error: {e}")
+            continue
+
+    # ── Handle text messages ──
     text = message.content.strip()
     if not text or text.startswith("/") or text.startswith("!"):
         return
-    # Skip very short messages
     if len(text) < 2:
         return
 
@@ -595,13 +1212,20 @@ async def on_message(message):
     if not src:
         return
 
-    tgt_lang = channel_target_lang.get(ch_id, "id")
+    # Auto-assign language role on first detected message
+    if message.guild and message.author.id not in user_lang_prefs:
+        user_lang_prefs[message.author.id] = src
+        await auto_assign_role(message.author, message.guild, src)
 
-    # Determine translation direction
+    # Determine target: use user's personal pref if set, else channel default
+    user_pref = user_lang_prefs.get(message.author.id)
     if src == "zh":
         tgt = tgt_lang
     elif src == tgt_lang:
         tgt = "zh"
+    elif user_pref and src == user_pref:
+        # User's language detected, translate to opposite
+        tgt = "zh" if user_pref != "zh" else tgt_lang
     else:
         tgt = "zh"
 
@@ -613,16 +1237,13 @@ async def on_message(message):
         return
 
     flag = LANG_FLAGS.get(tgt, "🌐")
-
-    # Build embed for clean presentation
-    embed = discord.Embed(
-        description=f"{flag} {result}",
-        color=0x06C755  # Green accent
-    )
+    embed = discord.Embed(description=f"{flag} {result}", color=0x06C755)
     embed.set_footer(text=f"翻譯 {LANG_NAMES.get(src, src)[:2]} → {LANG_NAMES.get(tgt, tgt)[:2]}")
+    view = TranslateView(text, src, tgt)
 
     try:
-        await message.reply(embed=embed, mention_author=False)
+        await message.reply(embed=embed, view=view, mention_author=False)
+        usage_stats["text_translations"] += 1
     except Exception as e:
         logger.error(f"Reply error: {e}")
 
@@ -636,13 +1257,31 @@ async def cmd_help(interaction: discord.Interaction):
         description="華新麗華鹽水廠 — 多語翻譯機器人",
         color=0x06C755
     )
-    embed.add_field(name="💬 自動翻譯", value="在頻道中直接輸入文字，自動偵測語言翻譯", inline=False)
-    embed.add_field(name="📦 /qry <客戶名>", value="查詢客戶儲區位置", inline=False)
-    embed.add_field(name="📢 /notice <訊息>", value="發送雙語公告（中文↔目標語）", inline=False)
-    embed.add_field(name="🌐 /lang <語言代碼>", value="設定頻道目標語言（id/en/vi/th/ja/ko/ms/tl）", inline=False)
-    embed.add_field(name="🔇 /skip <@使用者>", value="切換某使用者的翻譯跳過狀態", inline=False)
-    embed.add_field(name="⏸️ /toggle", value="開關本頻道的自動翻譯", inline=False)
-    embed.add_field(name="ℹ️ /status", value="查看本頻道翻譯設定", inline=False)
+    embed.add_field(name="💬 自動翻譯", value="頻道打字自動翻譯＋按鈕切換語言", inline=False)
+    embed.add_field(name="🏳️ 旗幟反應翻譯", value="對訊息加 🇮🇩🇹🇼🇬🇧🇻🇳🇹🇭🇯🇵🇰🇷 翻譯", inline=False)
+    embed.add_field(name="📋 右鍵翻譯", value="長按訊息 → 應用程式 → **翻譯這段**", inline=False)
+    embed.add_field(name="💬 私訊翻譯", value="直接私訊 bot 翻譯", inline=False)
+    embed.add_field(name="🖼️ 圖片翻譯", value="上傳圖片自動 OCR 翻譯", inline=False)
+    embed.add_field(name="🎤 語音翻譯", value="上傳語音檔 Whisper 辨識翻譯", inline=False)
+    embed.add_field(name="📋 工單偵測", value="上傳製造指示書自動查儲區", inline=False)
+    embed.add_field(name="👋 歡迎訊息", value="新成員加入自動雙語歡迎", inline=False)
+    embed.add_field(name="🏷️ 自動角色", value="偵測語言自動分配語言角色", inline=False)
+    embed.add_field(name="📦 /qry <客戶>", value="儲區查詢（自動補全）", inline=True)
+    embed.add_field(name="🔍 /search <字>", value="模糊搜尋客戶儲區", inline=True)
+    embed.add_field(name="📖 /term <字>", value="工廠術語查詢", inline=True)
+    embed.add_field(name="📢 /notice <訊息>", value="雙語公告", inline=True)
+    embed.add_field(name="📌 /pin <訊息>", value="雙語公告釘選 🔒", inline=True)
+    embed.add_field(name="📝 /handover", value="交班雙語模板", inline=True)
+    embed.add_field(name="🚨 /report", value="異常回報表單（Modal）", inline=True)
+    embed.add_field(name="📊 /poll", value="雙語投票", inline=True)
+    embed.add_field(name="🌐 /mylang", value="個人語言偏好（下拉選單）", inline=True)
+    embed.add_field(name="🌐 /lang 🔒", value="頻道語言（管理員）", inline=True)
+    embed.add_field(name="🔇 /skip 🔒", value="跳過翻譯（管理員）", inline=True)
+    embed.add_field(name="⏸️ /toggle 🔒", value="開關翻譯（管理員）", inline=True)
+    embed.add_field(name="📊 /stats", value="使用統計", inline=True)
+    embed.add_field(name="ℹ️ /status", value="頻道設定", inline=True)
+    embed.set_footer(text="🔒=管理員限定 | 華新麗華鹽水廠 不鏽鋼事業部")
+    usage_stats["slash_commands"] += 1
     await interaction.response.send_message(embed=embed)
 
 
@@ -652,69 +1291,168 @@ async def cmd_qry(interaction: discord.Interaction, customer: str):
     name, entries = query_storage(customer)
     if not entries:
         await interaction.response.send_message(
-            f"❌ 找不到客戶「{customer}」\n💡 試試部分名稱，例如 `DACAPO`、`大成`",
+            f"❌ 找不到客戶「{customer}」\n💡 試試 `/search {customer}` 模糊搜尋",
             ephemeral=True
         )
         return
-
-    embed = discord.Embed(
-        title=f"📦 {name} — 儲區查詢",
-        color=0x06C755
-    )
+    embed = discord.Embed(title=f"📦 {name} — 儲區查詢", color=0x06C755)
     for length, area in entries:
         zh = format_length_zh(length)
         embed.add_field(name=zh, value=f"**{area}**", inline=True)
     embed.set_footer(text="儲區資料 | 華新麗華鹽水廠")
+    usage_stats["slash_commands"] += 1
     await interaction.response.send_message(embed=embed)
 
 
 @cmd_qry.autocomplete("customer")
 async def qry_autocomplete(interaction: discord.Interaction, current: str):
-    """Autocomplete customer names for /qry"""
     if not current:
-        # Show first 25 customers
-        choices = [app_commands.Choice(name=k, value=k)
-                   for k in sorted(STORAGE_LOOKUP.keys())[:25]]
+        choices = [app_commands.Choice(name=k, value=k) for k in sorted(STORAGE_LOOKUP.keys())[:25]]
     else:
-        matches = [k for k in STORAGE_LOOKUP.keys()
-                   if current.lower() in k.lower()]
+        matches = [k for k in STORAGE_LOOKUP.keys() if current.lower() in k.lower()]
         choices = [app_commands.Choice(name=m, value=m) for m in sorted(matches)[:25]]
     return choices
+
+
+@bot.tree.command(name="search", description="模糊搜尋多個客戶儲區")
+@app_commands.describe(keyword="客戶名稱關鍵字")
+async def cmd_search(interaction: discord.Interaction, keyword: str):
+    kw = keyword.strip().lower()
+    matches = [(k, v) for k, v in STORAGE_LOOKUP.items() if kw in k.lower()]
+    if not matches:
+        await interaction.response.send_message(f"❌ 找不到包含「{keyword}」的客戶", ephemeral=True)
+        return
+    embed = discord.Embed(title=f"🔍 搜尋結果：{keyword}（{len(matches)} 筆）", color=0x06C755)
+    for name, entries in matches[:15]:
+        zones = " | ".join(f"{format_length_zh(l)}: {a}" for l, a in entries)
+        embed.add_field(name=name, value=zones, inline=False)
+    if len(matches) > 15:
+        embed.set_footer(text=f"還有 {len(matches) - 15} 筆未顯示，請縮小搜尋範圍")
+    usage_stats["slash_commands"] += 1
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="notice", description="發送雙語公告")
 @app_commands.describe(message="公告內容（中文或印尼文）")
 async def cmd_notice(interaction: discord.Interaction, message: str):
     await interaction.response.defer()
-
-    src = detect_language(message)
-    if not src:
-        src = "zh"
-
+    src = detect_language(message) or "zh"
     ch_id = interaction.channel_id
     tgt_lang = channel_target_lang.get(ch_id, "id")
     tgt = tgt_lang if src == "zh" else "zh"
-
     result = translate(message, src, tgt)
     if not result:
         await interaction.followup.send("❌ 翻譯失敗，請稍後再試")
         return
+    src_flag = LANG_FLAGS.get(src, "")
+    tgt_flag = LANG_FLAGS.get(tgt, "")
+    embed = discord.Embed(title="📢 公告 / Pengumuman", color=0xFFD700)
+    embed.add_field(name=f"{src_flag} 原文", value=message, inline=False)
+    embed.add_field(name=f"{tgt_flag} 翻譯", value=result, inline=False)
+    embed.set_footer(text=f"由 {interaction.user.display_name} 發送")
+    usage_stats["slash_commands"] += 1
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="pin", description="發送雙語公告並釘選（管理員）")
+@app_commands.describe(message="公告內容")
+async def cmd_pin(interaction: discord.Interaction, message: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ 需要管理員權限 / Perlu izin admin", ephemeral=True)
+        return
+    await interaction.response.defer()
+    src = detect_language(message) or "zh"
+    ch_id = interaction.channel_id
+    tgt_lang = channel_target_lang.get(ch_id, "id")
+    tgt = tgt_lang if src == "zh" else "zh"
+    result = translate(message, src, tgt)
+    if not result:
+        await interaction.followup.send("❌ 翻譯失敗")
+        return
+    src_flag = LANG_FLAGS.get(src, "")
+    tgt_flag = LANG_FLAGS.get(tgt, "")
+    embed = discord.Embed(title="📌 重要公告 / Pengumuman Penting", color=0xFF4444)
+    embed.add_field(name=f"{src_flag} 原文", value=message, inline=False)
+    embed.add_field(name=f"{tgt_flag} 翻譯", value=result, inline=False)
+    embed.set_footer(text=f"由 {interaction.user.display_name} 釘選")
+    msg = await interaction.followup.send(embed=embed)
+    try:
+        await msg.pin()
+    except Exception:
+        pass
+    usage_stats["slash_commands"] += 1
+
+
+@bot.tree.command(name="handover", description="交班雙語模板")
+async def cmd_handover(interaction: discord.Interaction):
+    usage_stats["slash_commands"] += 1
+    await interaction.response.send_message("選擇交班方向：", view=HandoverView(), ephemeral=True)
+
+
+@bot.tree.command(name="report", description="異常回報（彈出表單填寫）")
+async def cmd_report(interaction: discord.Interaction):
+    usage_stats["slash_commands"] += 1
+    await interaction.response.send_modal(ReportModal())
+
+
+@bot.tree.command(name="poll", description="建立雙語投票")
+@app_commands.describe(
+    question="投票問題",
+    option1="選項1", option2="選項2",
+    option3="選項3（可選）", option4="選項4（可選）",
+)
+async def cmd_poll(interaction: discord.Interaction, question: str,
+                   option1: str, option2: str,
+                   option3: str = None, option4: str = None):
+    await interaction.response.defer()
+    options = [option1, option2]
+    if option3:
+        options.append(option3)
+    if option4:
+        options.append(option4)
+
+    # Translate question and options
+    src = detect_language(question) or "zh"
+    tgt = "id" if src == "zh" else "zh"
+
+    q_translated = translate(question, src, tgt) or question
+    options_translated = []
+    for opt in options:
+        t = translate(opt, src, tgt) or opt
+        options_translated.append(t)
 
     src_flag = LANG_FLAGS.get(src, "")
     tgt_flag = LANG_FLAGS.get(tgt, "")
 
     embed = discord.Embed(
-        title="📢 公告 / Pengumuman",
-        color=0xFFD700
+        title=f"📊 投票 / Voting",
+        color=0x5865F2
     )
-    embed.add_field(name=f"{src_flag} 原文", value=message, inline=False)
-    embed.add_field(name=f"{tgt_flag} 翻譯", value=result, inline=False)
-    embed.set_footer(text=f"由 {interaction.user.display_name} 發送")
+    embed.add_field(name=f"{src_flag} {question}", value=f"{tgt_flag} {q_translated}", inline=False)
+    for i, (zh, tgt_opt) in enumerate(zip(options, options_translated)):
+        embed.add_field(name=f"選項 {i+1}", value=f"{zh} / {tgt_opt}", inline=True)
+    embed.set_footer(text=f"由 {interaction.user.display_name} 發起 | 點按鈕投票")
 
-    await interaction.followup.send(embed=embed)
+    if src == "zh":
+        view = PollView(options, options_translated, tgt_flag)
+    else:
+        view = PollView(options_translated, options, src_flag)
+
+    usage_stats["slash_commands"] += 1
+    await interaction.followup.send(embed=embed, view=view)
 
 
-@bot.tree.command(name="lang", description="設定頻道目標語言")
+@bot.tree.command(name="mylang", description="設定你的個人語言偏好（下拉選單）")
+async def cmd_mylang(interaction: discord.Interaction):
+    usage_stats["slash_commands"] += 1
+    await interaction.response.send_message(
+        "🌐 選擇你的語言 / Pilih bahasa kamu:",
+        view=LangSelectView(),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="lang", description="設定頻道目標語言（管理員）")
 @app_commands.describe(language="目標語言代碼")
 @app_commands.choices(language=[
     app_commands.Choice(name="🇮🇩 印尼文", value="id"),
@@ -727,39 +1465,66 @@ async def cmd_notice(interaction: discord.Interaction, message: str):
     app_commands.Choice(name="🇵🇭 菲律賓文", value="tl"),
 ])
 async def cmd_lang(interaction: discord.Interaction, language: app_commands.Choice[str]):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ 需要管理員權限 / Perlu izin admin", ephemeral=True)
+        return
     channel_target_lang[interaction.channel_id] = language.value
     zh_name = LANG_NAMES_ZH.get(language.value, language.value)
-    await interaction.response.send_message(
-        f"✅ 本頻道目標語言已設為 **{language.name}**（{zh_name}）"
-    )
+    usage_stats["slash_commands"] += 1
+    await interaction.response.send_message(f"✅ 本頻道目標語言已設為 **{language.name}**（{zh_name}）")
 
 
-@bot.tree.command(name="skip", description="切換使用者翻譯跳過狀態")
+@bot.tree.command(name="skip", description="切換使用者翻譯跳過狀態（管理員）")
 @app_commands.describe(user="要跳過翻譯的使用者")
 async def cmd_skip(interaction: discord.Interaction, user: discord.Member):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ 需要管理員權限 / Perlu izin admin", ephemeral=True)
+        return
     ch_id = interaction.channel_id
     if ch_id not in channel_skip_users:
         channel_skip_users[ch_id] = set()
-
     if user.id in channel_skip_users[ch_id]:
         channel_skip_users[ch_id].discard(user.id)
-        await interaction.response.send_message(
-            f"✅ **{user.display_name}** 的訊息將恢復翻譯"
-        )
+        await interaction.response.send_message(f"✅ **{user.display_name}** 的訊息將恢復翻譯")
     else:
         channel_skip_users[ch_id].add(user.id)
-        await interaction.response.send_message(
-            f"🔇 **{user.display_name}** 的訊息將不再翻譯"
-        )
+        await interaction.response.send_message(f"🔇 **{user.display_name}** 的訊息將不再翻譯")
+    usage_stats["slash_commands"] += 1
 
 
-@bot.tree.command(name="toggle", description="開關本頻道的自動翻譯")
+@bot.tree.command(name="toggle", description="開關本頻道的自動翻譯（管理員）")
 async def cmd_toggle(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ 需要管理員權限 / Perlu izin admin", ephemeral=True)
+        return
     ch_id = interaction.channel_id
     current = channel_settings.get(ch_id, True)
     channel_settings[ch_id] = not current
     status = "開啟 ✅" if not current else "關閉 ❌"
+    usage_stats["slash_commands"] += 1
     await interaction.response.send_message(f"翻譯已{status}")
+
+
+@bot.tree.command(name="stats", description="查看翻譯使用統計")
+async def cmd_stats(interaction: discord.Interaction):
+    uptime_sec = time.time() - usage_stats["start_time"]
+    hours = int(uptime_sec // 3600)
+    minutes = int((uptime_sec % 3600) // 60)
+    embed = discord.Embed(title="📊 翻譯小助手 使用統計", color=0x06C755)
+    embed.add_field(name="⏱️ 運行時間", value=f"{hours}h {minutes}m", inline=True)
+    embed.add_field(name="💬 文字翻譯", value=str(usage_stats["text_translations"]), inline=True)
+    embed.add_field(name="🖼️ 圖片翻譯", value=str(usage_stats["image_translations"]), inline=True)
+    embed.add_field(name="🎤 語音翻譯", value=str(usage_stats["voice_translations"]), inline=True)
+    embed.add_field(name="📋 工單偵測", value=str(usage_stats["work_orders_detected"]), inline=True)
+    embed.add_field(name="🏳️ 反應翻譯", value=str(usage_stats["reaction_translations"]), inline=True)
+    embed.add_field(name="📋 右鍵翻譯", value=str(usage_stats["context_translations"]), inline=True)
+    embed.add_field(name="⌨️ 斜線指令", value=str(usage_stats["slash_commands"]), inline=True)
+    embed.add_field(name="📦 快取數量", value=str(len(translation_cache)), inline=True)
+    embed.add_field(name="👥 儲區客戶", value=str(len(STORAGE_LOOKUP)), inline=True)
+    embed.add_field(name="📖 術語詞條", value=str(len(ZH_TO_ID_HARD)), inline=True)
+    embed.add_field(name="🤖 GPT 模型", value="gpt-4o-mini", inline=True)
+    usage_stats["slash_commands"] += 1
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="status", description="查看本頻道翻譯設定")
@@ -769,16 +1534,11 @@ async def cmd_status(interaction: discord.Interaction):
     lang = channel_target_lang.get(ch_id, "id")
     zh_name = LANG_NAMES_ZH.get(lang, lang)
     skip_count = len(channel_skip_users.get(ch_id, set()))
-    cache_count = len(translation_cache)
-    customer_count = len(STORAGE_LOOKUP)
-
-    embed = discord.Embed(title="📊 頻道翻譯設定", color=0x06C755)
+    embed = discord.Embed(title="⚙️ 頻道翻譯設定", color=0x06C755)
     embed.add_field(name="翻譯狀態", value="✅ 開啟" if on else "❌ 關閉", inline=True)
     embed.add_field(name="目標語言", value=f"{LANG_FLAGS.get(lang, '')} {zh_name}", inline=True)
     embed.add_field(name="跳過人數", value=str(skip_count), inline=True)
-    embed.add_field(name="快取數量", value=str(cache_count), inline=True)
-    embed.add_field(name="儲區客戶", value=str(customer_count), inline=True)
-    embed.add_field(name="GPT 模型", value="gpt-4o-mini", inline=True)
+    usage_stats["slash_commands"] += 1
     await interaction.response.send_message(embed=embed)
 
 
@@ -787,43 +1547,324 @@ async def cmd_status(interaction: discord.Interaction):
 async def cmd_term(interaction: discord.Interaction, keyword: str):
     results = []
     kw = keyword.strip().lower()
-    # Search in ZH_TO_ID_HARD
     for zh, id_text in ZH_TO_ID_HARD.items():
         if kw in zh.lower() or kw in id_text.lower():
             results.append(f"**{zh}** → {id_text}")
     if not results:
-        await interaction.response.send_message(
-            f"❌ 找不到「{keyword}」相關術語\n💡 試試其他關鍵字",
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"❌ 找不到「{keyword}」相關術語", ephemeral=True)
         return
-    # Limit to 20 results
     display = results[:20]
     if len(results) > 20:
         display.append(f"... 還有 {len(results) - 20} 筆")
-
-    embed = discord.Embed(
-        title=f"📖 術語查詢：{keyword}",
-        description="\n".join(display),
-        color=0x06C755
-    )
+    embed = discord.Embed(title=f"📖 術語查詢：{keyword}", description="\n".join(display), color=0x06C755)
+    usage_stats["slash_commands"] += 1
     await interaction.response.send_message(embed=embed)
 
 
-# ─── Health endpoint (keeps Render free tier alive) ─────
+# ─── Admin Panel HTML ────────────────────────────────────
+ADMIN_HTML = '''<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>翻譯Bot 管理後台 (Discord)</title>
+<meta name="theme-color" content="#5865F2">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#e0e0e0;min-height:100vh}
+.header{background:linear-gradient(135deg,#5865F2,#7289DA);padding:16px;font-size:18px;font-weight:700;display:flex;align-items:center;gap:8px}
+.header img{width:28px;height:28px;border-radius:50%}
+#loginPage{padding:20px;max-width:400px;margin:40px auto}
+#loginPage h2{margin-bottom:16px;text-align:center}
+#mainPage{display:none}
+input[type=password],input[type=text]{width:100%;padding:12px;border:1px solid #333;border-radius:8px;background:#1a1a1a;color:#fff;font-size:15px;margin-bottom:12px}
+.btn{padding:10px 20px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer}
+.btn-purple{background:#5865F2;color:#fff}
+.btn-green{background:#06C755;color:#fff}
+.btn-red{background:#d93025;color:#fff}
+.btn-sm{padding:6px 12px;font-size:12px}
+.tabs{display:flex;overflow-x:auto;background:#111;border-bottom:2px solid #222}
+.tab{padding:12px 16px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;color:#888;border-bottom:2px solid transparent;margin-bottom:-2px}
+.tab.active{color:#5865F2;border-bottom-color:#5865F2}
+.panel{display:none;padding:12px}
+.panel.active{display:block}
+.card{background:#161616;border-radius:10px;padding:14px;margin-bottom:10px;border:1px solid #222}
+.card-title{font-weight:600;font-size:14px;margin-bottom:4px;display:flex;justify-content:space-between;align-items:center}
+.card-sub{font-size:12px;color:#888}
+.badge{font-size:11px;padding:2px 8px;border-radius:10px;font-weight:600}
+.badge-on{background:#06C75522;color:#06C755}
+.badge-off{background:#d9302522;color:#d93025}
+.stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.stat-box{background:#161616;border-radius:8px;padding:12px;text-align:center;border:1px solid #222}
+.stat-num{font-size:24px;font-weight:700;color:#5865F2}
+.stat-label{font-size:11px;color:#888;margin-top:4px}
+.empty{text-align:center;padding:20px;color:#666;font-size:13px}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:10px 20px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .3s;z-index:999}
+.toast.show{opacity:1}
+.toggle{position:relative;display:inline-block;width:44px;height:24px}
+.toggle input{opacity:0;width:0;height:0}
+.slider{position:absolute;cursor:pointer;inset:0;background:#444;border-radius:24px;transition:.3s}
+.slider::before{content:"";position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s}
+.toggle input:checked+.slider{background:#5865F2}
+.toggle input:checked+.slider::before{transform:translateX(20px)}
+.wl-item{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #222}
+select{width:100%;padding:10px;border-radius:8px;background:#1a1a1a;color:#fff;border:1px solid #333;font-size:14px;margin-bottom:8px}
+</style>
+</head>
+<body>
+<div class="header">🤖 翻譯Bot 管理後台 <span style="font-size:12px;color:#ddd;font-weight:400">Discord</span></div>
+
+<div id="loginPage">
+<h2>🔐 登入</h2>
+<input type="password" id="pwInput" placeholder="輸入管理密碼" onkeydown="if(event.key==='Enter')doLogin()">
+<button class="btn btn-purple" style="width:100%" onclick="doLogin()">登入</button>
+</div>
+
+<div id="mainPage">
+<div class="tabs">
+<div class="tab active" onclick="switchTab('dash')">總覽</div>
+<div class="tab" onclick="switchTab('channels')">頻道</div>
+<div class="tab" onclick="switchTab('users')">使用者</div>
+<div class="tab" onclick="switchTab('storage')">儲區</div>
+</div>
+
+<!-- Dashboard -->
+<div class="panel active" id="panel-dash">
+<div id="statsGrid" class="stat-grid"><div class="empty">載入中...</div></div>
+</div>
+
+<!-- Channels -->
+<div class="panel" id="panel-channels">
+<div id="channelList"><div class="empty">載入中...</div></div>
+</div>
+
+<!-- Users -->
+<div class="panel" id="panel-users">
+<div id="userList"><div class="empty">載入中...</div></div>
+</div>
+
+<!-- Storage -->
+<div class="panel" id="panel-storage">
+<div class="card">
+<div class="card-title">📦 儲區資料</div>
+<div id="storageStats"><div class="empty">載入中...</div></div>
+<div style="margin-top:10px">
+<button class="btn btn-sm" style="background:#333;color:#fff" onclick="downloadJson()">下載 JSON</button>
+</div>
+</div>
+</div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let KEY='';
+const API=window.location.origin+'/api/admin';
+
+function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2000)}
+
+async function api(path,method='GET',body=null){
+  try{
+    const opts={method,headers:{'X-Admin-Key':KEY,'Content-Type':'application/json'}};
+    if(body)opts.body=JSON.stringify(body);
+    const r=await fetch(API+path,opts);
+    if(r.status===403){toast('密碼錯誤');return null}
+    return r.json();
+  }catch(e){toast('連線失敗，請重試');return null}
+}
+
+function doLogin(){
+  KEY=document.getElementById('pwInput').value.trim();
+  if(!KEY){toast('請輸入密碼');return}
+  api('/status').then(d=>{
+    if(!d)return;
+    document.getElementById('loginPage').style.display='none';
+    document.getElementById('mainPage').style.display='block';
+    localStorage.setItem('dc_admin_key',KEY);
+    loadAll();
+  });
+}
+
+function switchTab(name){
+  const labels={'dash':'總覽','channels':'頻道','users':'使用者','storage':'儲區'};
+  document.querySelectorAll('.tab').forEach(t=>{t.classList.toggle('active',t.textContent.includes(labels[name]))});
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.getElementById('panel-'+name).classList.add('active');
+}
+
+function loadAll(){loadStats();loadChannels();loadUsers();loadStorage()}
+
+async function loadStats(){
+  const d=await api('/stats');
+  if(!d)return;
+  const el=document.getElementById('statsGrid');
+  el.innerHTML=Object.entries(d).map(([k,v])=>{
+    if(k==='start_time')return '';
+    const labels={'text_translations':'💬 文字翻譯','image_translations':'🖼️ 圖片翻譯','voice_translations':'🎤 語音翻譯','work_orders_detected':'📋 工單偵測','slash_commands':'⌨️ 指令','reaction_translations':'🏳️ 反應翻譯','context_translations':'📋 右鍵翻譯','uptime':'⏱️ 運行時間','cache_count':'📦 快取','customer_count':'👥 客戶','guilds':'🏠 伺服器','channels_active':'📢 活躍頻道','users_known':'👤 已知使用者'};
+    return `<div class="stat-box"><div class="stat-num">${v}</div><div class="stat-label">${labels[k]||k}</div></div>`;
+  }).join('');
+}
+
+async function loadChannels(){
+  const d=await api('/channels');
+  if(!d)return;
+  const el=document.getElementById('channelList');
+  if(!d.channels||!d.channels.length){el.innerHTML='<div class="empty">尚無頻道紀錄</div>';return}
+  el.innerHTML=d.channels.map(c=>`
+    <div class="card">
+      <div class="card-title">
+        <span>#${c.name} <span style="color:#666;font-size:11px">${c.guild}</span></span>
+        <span class="badge ${c.translation_on?'badge-on':'badge-off'}">${c.translation_on?'翻譯開':'翻譯關'}</span>
+      </div>
+      <div class="card-sub">語言: ${c.target_lang} ｜跳過: ${c.skip_count}人</div>
+    </div>
+  `).join('');
+}
+
+async function loadUsers(){
+  const d=await api('/users');
+  if(!d)return;
+  const el=document.getElementById('userList');
+  if(!d.users||!d.users.length){el.innerHTML='<div class="empty">尚無使用者紀錄</div>';return}
+  el.innerHTML=d.users.map(u=>`
+    <div class="card">
+      <div class="card-title"><span>${u.name}</span><span class="badge badge-on">${u.lang}</span></div>
+    </div>
+  `).join('');
+}
+
+async function loadStorage(){
+  const d=await api('/storage');
+  if(!d)return;
+  document.getElementById('storageStats').innerHTML='<div style="font-size:14px">客戶數: <b>'+d.count+'</b></div>';
+}
+
+async function downloadJson(){
+  try{
+    const r=await fetch(API+'/storage/json',{headers:{'X-Admin-Key':KEY}});
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;a.download='storage_data.json';a.click();
+    URL.revokeObjectURL(url);
+    toast('JSON 已下載');
+  }catch(e){toast('下載失敗')}
+}
+
+window.addEventListener('load',()=>{
+  const k=localStorage.getItem('dc_admin_key');
+  if(k){document.getElementById('pwInput').value=k;doLogin()}
+});
+</script>
+</body>
+</html>'''
+
+
+# ─── Web server + Admin API ──────────────────────────────
 async def health_handler(request):
     return web.Response(text='{"status":"ok"}', content_type="application/json")
+
+async def admin_page_handler(request):
+    return web.Response(text=ADMIN_HTML, content_type="text/html")
+
+def check_admin_key(request):
+    key = request.headers.get("X-Admin-Key", "")
+    return key == ADMIN_KEY
+
+async def api_admin_status(request):
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    return web.json_response({"ok": True})
+
+async def api_admin_stats(request):
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    uptime_sec = time.time() - usage_stats["start_time"]
+    hours = int(uptime_sec // 3600)
+    minutes = int((uptime_sec % 3600) // 60)
+    data = {
+        "uptime": f"{hours}h {minutes}m",
+        "text_translations": usage_stats["text_translations"],
+        "image_translations": usage_stats["image_translations"],
+        "voice_translations": usage_stats["voice_translations"],
+        "work_orders_detected": usage_stats["work_orders_detected"],
+        "slash_commands": usage_stats["slash_commands"],
+        "reaction_translations": usage_stats["reaction_translations"],
+        "context_translations": usage_stats["context_translations"],
+        "cache_count": len(translation_cache),
+        "customer_count": len(STORAGE_LOOKUP),
+        "guilds": len(bot.guilds) if bot.is_ready() else 0,
+        "channels_active": len(channel_settings),
+        "users_known": len(user_lang_prefs),
+    }
+    return web.json_response(data)
+
+async def api_admin_channels(request):
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    channels = []
+    if bot.is_ready():
+        for guild in bot.guilds:
+            for ch in guild.text_channels:
+                ch_id = ch.id
+                if ch_id in channel_settings or ch_id in channel_target_lang:
+                    channels.append({
+                        "id": str(ch_id),
+                        "name": ch.name,
+                        "guild": guild.name,
+                        "translation_on": channel_settings.get(ch_id, True),
+                        "target_lang": channel_target_lang.get(ch_id, "id"),
+                        "skip_count": len(channel_skip_users.get(ch_id, set())),
+                    })
+    return web.json_response({"channels": channels})
+
+async def api_admin_users(request):
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    users = []
+    for uid, lang in user_lang_prefs.items():
+        name = str(uid)
+        if bot.is_ready():
+            for guild in bot.guilds:
+                member = guild.get_member(uid)
+                if member:
+                    name = member.display_name
+                    break
+        users.append({"id": str(uid), "name": name, "lang": lang})
+    users.sort(key=lambda x: x["name"])
+    return web.json_response({"users": users})
+
+async def api_admin_storage(request):
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    return web.json_response({"count": len(STORAGE_LOOKUP)})
+
+async def api_admin_storage_json(request):
+    if not check_admin_key(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    json_str = json.dumps(STORAGE_LOOKUP, ensure_ascii=False, indent=2)
+    return web.Response(
+        text=json_str, content_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=storage_data.json"}
+    )
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/health", health_handler)
     app.router.add_get("/", health_handler)
+    app.router.add_get("/admin", admin_page_handler)
+    app.router.add_get("/api/admin/status", api_admin_status)
+    app.router.add_get("/api/admin/stats", api_admin_stats)
+    app.router.add_get("/api/admin/channels", api_admin_channels)
+    app.router.add_get("/api/admin/users", api_admin_users)
+    app.router.add_get("/api/admin/storage", api_admin_storage)
+    app.router.add_get("/api/admin/storage/json", api_admin_storage_json)
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Web server started on port {port}")
+    logger.info(f"Web server started on port {port} (admin: /admin)")
 
 # ─── Run ────────────────────────────────────────────────
 async def main():
